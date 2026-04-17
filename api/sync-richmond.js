@@ -49,7 +49,10 @@ export default async function handler(req, res) {
       descRes.data.map(d => [d.itemCodeNew, d])
     );
 
-    const products = productsRes.data.slice(0, 20);
+    //const products = productsRes.data.slice(0, 20);
+    const BATCH_SIZE = 100;
+    const products = productsRes.data.slice(0, BATCH_SIZE);
+    
     for (const p of products) {
       const code = p.itemCodeNew;
 
