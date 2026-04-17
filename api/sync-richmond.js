@@ -49,10 +49,10 @@ export default async function handler(req, res) {
       descRes.data.map(d => [d.itemCodeNew, d])
     );
 
-    //const products = productsRes.data.slice(0, 20);
-    const products = productsRes.data.filter(
-      p => p.itemCodeNew === "215853"
-    );
+    const offset = parseInt(req.query.offset || "0");
+    const limit = 100;
+    
+    const products = productsRes.data.slice(offset, offset + limit);
     
     for (const p of products) {
       const code = p.itemCodeNew;
