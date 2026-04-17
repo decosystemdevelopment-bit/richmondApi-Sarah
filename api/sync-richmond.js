@@ -50,8 +50,9 @@ export default async function handler(req, res) {
     );
 
     //const products = productsRes.data.slice(0, 20);
-    const BATCH_SIZE = 100;
-    const products = productsRes.data.slice(0, BATCH_SIZE);
+    const products = productsRes.data.filter(
+      p => p.itemCodeNew === "215853"
+    );
     
     for (const p of products) {
       const code = p.itemCodeNew;
@@ -65,7 +66,10 @@ export default async function handler(req, res) {
         price: parseFloat(priceData?.retailPrice?.replace(",", ".")) || 0,
         stock: parseInt(stockData?.StockIndicator) || 0,
         description: desc?.longDescriptionFR || "",
-        images: p["Product Images"] || ""
+        images: (p["Product Images"] || "")
+          .split(",")
+          .map(i => i.trim())
+          .sort()
       };
 
       const hash = generateHash(productData);
@@ -74,10 +78,12 @@ export default async function handler(req, res) {
         .from("products")
         .select("richmond_hash")
         .eq("item_code", code)
-        .single();
+        .maybeSingle();
 
       const hasChanged = existing?.richmond_hash !== hash;
-
+      console.log("Produit:", code);
+      console.log("Nouveau hash:", hash);
+      console.log("Ancien hash:", existing?.richmond_hash);
       await supabase.from("products").upsert({
         item_code: code,
         title: productData.title,
