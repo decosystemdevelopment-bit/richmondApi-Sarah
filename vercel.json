@@ -1,1 +1,12 @@
-
+{
+  "cron": [
+    {
+      "path": "/api/sync-richmond",
+      "schedule": "0 */12 * * *"
+    },
+    {
+      "path": "/api/sync-shopify",
+      "schedule": "*/30 * * * *"
+    }
+  ]
+}
