@@ -49,7 +49,8 @@ export default async function handler(req, res) {
       descRes.data.map(d => [d.itemCodeNew, d])
     );
 
-    for (const p of productsRes.data) {
+    const products = productsRes.data.slice(0, 20);
+    for (const p of products) {
       const code = p.itemCodeNew;
 
       const priceData = pricingMap[code];
