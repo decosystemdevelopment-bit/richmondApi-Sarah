@@ -1,3 +1,26 @@
+/**
+ * SCRIPT UTILITAIRE (NE PAS UTILISER EN PROD AUTOMATIQUE)
+ *
+ * Objectif :
+ * Associer les produits Shopify aux produits Supabase
+ * via le SKU (item_code).
+ *
+ * Usage :
+ * - migration initiale
+ * - récupération des shopify_product_id
+ * - debug ponctuel
+ *
+ * Ne doit PAS être exécuté en routine :
+ * - risque d’écraser des données correctes
+ * - dépend fortement de la qualité des SKU Shopify
+ *
+ * Hypothèse :
+ * - 1 produit = 1 variant
+ * - SKU = item_code
+ *
+ * ============================================================
+ */
+
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 
