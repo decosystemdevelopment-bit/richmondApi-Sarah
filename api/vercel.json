@@ -1,0 +1,12 @@
+{
+  "crons": [
+    {
+      "path": "/api/sync-richmond",
+      "schedule": "0 */6 * * *"
+    },
+    {
+      "path": "/api/sync-shopify",
+      "schedule": "*/15 * * * *"
+    }
+  ]
+}
