@@ -184,12 +184,24 @@ export default async function handler(req, res) {
     /**
      * 3. PAGINATION
      */
-    const offset = parseInt(req.query.offset || "0");
+    /*const offset = parseInt(req.query.offset || "0");
     const limit = 100;
 
     const allProducts = productsRes.data;
-    const batch = allProducts.slice(offset, offset + limit);
-
+    const batch = allProducts.slice(offset, offset + limit);*/
+    const limit = 100;
+    const allProducts = productsRes.data;
+    
+    let processed = 0;
+    
+    for (let offset = 0; offset < allProducts.length; offset += limit) {
+      const batch = allProducts.slice(offset, offset + limit);
+    
+      // TON CODE EXISTANT (loop produits)
+      // push dans upserts
+    
+      processed += batch.length;
+    }
     const codes = batch.map(p => p.itemCodeNew);
 
     /**
