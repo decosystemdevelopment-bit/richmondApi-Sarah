@@ -71,13 +71,11 @@
  *
  * ============================================================
  */
-
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 
 /**
- * Connexion à Supabase
- * Utilisé comme source de vérité intermédiaire
+ * 🔌 Supabase
  */
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -85,56 +83,53 @@ const supabase = createClient(
 );
 
 /**
- * Configuration Shopify
+ * 🛒 Shopify config
  */
 const SHOP = process.env.SHOPIFY_SHOP;
 const TOKEN = process.env.SHOPIFY_TOKEN;
 
-/**
- * Headers requis pour toutes les requêtes Shopify
- */
 const HEADERS = {
   "X-Shopify-Access-Token": TOKEN,
   "Content-Type": "application/json"
 };
 
 /**
- * CREATE PRODUCT (Shopify)
- * Utilisé uniquement si le produit n'existe pas encore (pas de shopify_product_id)
+ * ⏱️ Rate limit protection
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * 🧠 Map status → Shopify
+ */
+function mapStatus(status) {
+  return status === "archived" ? "draft" : "active";
+}
+
+/**
+ * 🔍 Get first variant ID (IMPORTANT)
+ */
+async function getVariantId(productId) {
+  const res = await axios.get(
+    `https://${SHOP}/admin/api/2025-01/products/${productId}.json`,
+    { headers: HEADERS }
+  );
+
+  return res.data.product.variants?.[0]?.id;
+}
+
+/**
+ * ➕ CREATE PRODUCT
  */
 async function createProduct(p) {
   const res = await axios.post(
     `https://${SHOP}/admin/api/2025-01/products.json`,
     {
       product: {
-        title: p.title,                  // nom du produit
-        body_html: p.description_fr,     // description HTML
-        variants: [
-          {
-            price: p.price.toString()    // Shopify attend une string
-          }
-        ]
-      }
-    },
-    { headers: HEADERS }
-  );
-
-  // retourne l'ID Shopify pour le stocker en base
-  return res.data.product.id;
-}
-
-/**
- * UPDATE PRODUCT (Shopify)
- * Met à jour un produit existant
- */
-async function updateProduct(id, p) {
-  await axios.put(
-    `https://${SHOP}/admin/api/2025-01/products/${id}.json`,
-    {
-      product: {
-        id,    // obligatoire pour update
         title: p.title,
         body_html: p.description_fr,
+        status: mapStatus(p.status),
         variants: [
           {
             price: p.price.toString()
@@ -144,69 +139,129 @@ async function updateProduct(id, p) {
     },
     { headers: HEADERS }
   );
+
+  return {
+    id: res.data.product.id,
+    variantId: res.data.product.variants?.[0]?.id
+  };
 }
 
 /**
- * Endpoint Vercel
- * Synchronise Supabase → Shopify
+ * 🔄 UPDATE PRODUCT
+ */
+async function updateProduct(productId, p) {
+  // 1. récupérer le variant ID
+  const variantId = await getVariantId(productId);
+
+  // 2. update produit
+  await axios.put(
+    `https://${SHOP}/admin/api/2025-01/products/${productId}.json`,
+    {
+      product: {
+        id: productId,
+        title: p.title,
+        body_html: p.description_fr,
+        status: mapStatus(p.status)
+      }
+    },
+    { headers: HEADERS }
+  );
+
+  // 3. update variant (price)
+  if (variantId) {
+    await axios.put(
+      `https://${SHOP}/admin/api/2025-01/variants/${variantId}.json`,
+      {
+        variant: {
+          id: variantId,
+          price: p.price.toString()
+        }
+      },
+      { headers: HEADERS }
+    );
+  }
+}
+
+/**
+ * 🚀 Handler
  */
 export default async function handler(req, res) {
   try {
-    console.log("Shopify sync...");
+    console.log("🛒 Shopify sync...");
 
     /**
-     * Récupère uniquement les produits à mettre à jour
-     * (flag activé par le script Richmond)
+     * 1. FETCH produits à sync
      */
-    const { data: products } = await supabase
+    const { data: products, error } = await supabase
       .from("products")
       .select("*")
       .eq("needs_shopify_update", true)
-      .limit(50); // batch pour éviter rate limit Shopify
+      .limit(50);
 
-    /**
-     * Boucle sur chaque produit à synchroniser
-     */
-    for (const p of products) {
-      let id = p.shopify_product_id;
+    if (error) throw error;
 
-      /**
-       * LOGIQUE :
-       * - Si pas d'ID → produit inexistant → CREATE
-       * - Sinon → produit existant → UPDATE
-       */
-      if (!id) {
-        console.log(" Creating product:", p.title);
-        id = await createProduct(p);
-      } else {
-        console.log(" Updating product:", p.title);
-        await updateProduct(id, p);
-      }
-
-      /**
-       *  Mise à jour Supabase après sync Shopify
-       */
-      await supabase
-        .from("products")
-        .update({
-          shopify_product_id: id,                // stocke ID si création
-          needs_shopify_update: false,           // reset du flag
-          last_shopify_sync: new Date().toISOString()
-        })
-        .eq("id", p.id);
+    if (!products || products.length === 0) {
+      console.log("✅ Nothing to sync");
+      return res.status(200).json({ ok: true, message: "Nothing to sync" });
     }
 
-    console.log(" Shopify sync done");
+    /**
+     * 2. LOOP
+     */
+    for (const p of products) {
+      try {
+        let shopifyId = p.shopify_product_id;
 
-    return res.status(200).json({ ok: true });
+        if (!shopifyId) {
+          console.log("➕ Creating:", p.title);
+
+          const created = await createProduct(p);
+          shopifyId = created.id;
+
+        } else {
+          console.log("🔄 Updating:", p.title);
+
+          await updateProduct(shopifyId, p);
+        }
+
+        /**
+         * 3. UPDATE DB
+         */
+        await supabase
+          .from("products")
+          .update({
+            shopify_product_id: shopifyId,
+            needs_shopify_update: false,
+            last_shopify_sync: new Date().toISOString()
+          })
+          .eq("id", p.id);
+
+        /**
+         * ⏱️ Anti rate-limit
+         */
+        await sleep(500);
+
+      } catch (err) {
+        console.error("❌ Product error:", p.item_code);
+        console.error(err.response?.data || err.message);
+
+        // ⚠️ ne pas bloquer toute la boucle
+        continue;
+      }
+    }
+
+    console.log("✅ Shopify sync done");
+
+    return res.status(200).json({
+      ok: true,
+      processed: products.length
+    });
 
   } catch (err) {
-    /**
-     * Gestion erreur
-     * Affiche soit l'erreur Shopify, soit erreur générique
-     */
-    console.error(err.response?.data || err.message);
+    console.error("❌ Global error:", err.response?.data || err.message);
 
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({
+      error: err.message
+    });
   }
 }
