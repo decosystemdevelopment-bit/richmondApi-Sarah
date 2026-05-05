@@ -66,17 +66,21 @@
 
 
 /* New */
-
-
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 
+/**
+ * 🔌 Supabase
+ */
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
+/**
+ * 🌐 Richmond API
+ */
 const BASE = "https://www.richmondinteriors.nl/api/v1/products";
 const AUTH = process.env.RICHMOND_AUTH;
 
@@ -87,31 +91,73 @@ const API = {
   desc: `${BASE}/descriptions/${AUTH}`
 };
 
+/**
+ * 💰 Pricing
+ */
 const COEFF = parseFloat(process.env.PRICE_COEFF || "2.3");
 
+/**
+ * 🔐 Hash
+ */
 function generateHash(data) {
-  return crypto.createHash("md5").update(JSON.stringify(data)).digest("hex");
+  return crypto
+    .createHash("md5")
+    .update(JSON.stringify(data))
+    .digest("hex");
 }
 
+/**
+ * 💰 Price parser
+ */
 function parsePrice(value) {
   if (!value) return 0;
   return parseFloat(value.replace(",", "."));
 }
 
+/**
+ * 📦 Stock parser SAFE
+ */
+function parseStock(value) {
+  if (!value) return 0;
+
+  const num = parseInt(String(value).replace(/[^\d]/g, ""));
+  return isNaN(num) ? 0 : num;
+}
+
+/**
+ * 🖼️ Images builder
+ */
 function buildImages(p) {
   const base = p["Product Images Location"] || "";
+
   return (p["Product Images"] || "")
     .split(",")
     .map(i => i.trim())
-    .filter(Boolean)
+    .filter(i => i && i.length > 0)
     .map(i => base + i)
     .sort();
 }
 
+/**
+ * 🧠 Status mapping
+ */
+function mapStatus(p) {
+  const raw = (p["Product Status"] || "").toLowerCase();
+
+  if (raw.includes("discontinued")) return "archived";
+  return "active";
+}
+
+/**
+ * 🚀 Handler
+ */
 export default async function handler(req, res) {
   try {
     console.log("🔄 Richmond sync...");
 
+    /**
+     * 1. FETCH API
+     */
     const [productsRes, pricingRes, stockRes, descRes] =
       await Promise.all([
         axios.get(API.details),
@@ -120,6 +166,9 @@ export default async function handler(req, res) {
         axios.get(API.desc)
       ]);
 
+    /**
+     * 2. MAPS
+     */
     const pricingMap = Object.fromEntries(
       pricingRes.data.map(p => [p.itemCodeNew, p])
     );
@@ -132,14 +181,20 @@ export default async function handler(req, res) {
       descRes.data.map(d => [d.itemCodeNew, d])
     );
 
+    /**
+     * 3. PAGINATION
+     */
     const offset = parseInt(req.query.offset || "0");
     const limit = 100;
 
-    const batch = productsRes.data.slice(offset, offset + limit);
+    const allProducts = productsRes.data;
+    const batch = allProducts.slice(offset, offset + limit);
 
     const codes = batch.map(p => p.itemCodeNew);
 
-    // 🔥 BULK fetch existing hashes
+    /**
+     * 4. FETCH EXISTING (BULK)
+     */
     const { data: existingRows } = await supabase
       .from("products")
       .select("item_code, richmond_hash")
@@ -151,6 +206,9 @@ export default async function handler(req, res) {
 
     const upserts = [];
 
+    /**
+     * 5. BUILD PRODUCTS
+     */
     for (const p of batch) {
       const code = p.itemCodeNew;
 
@@ -165,9 +223,10 @@ export default async function handler(req, res) {
         title: p.description2 || p.description3 || "",
         price: finalPrice,
         richmond_price: basePrice,
-        stock: parseInt(stockData?.onlineAvailabilityText) || 0,
+        stock: parseStock(stockData?.onlineAvailabilityText),
         description: (desc?.longDescriptionFR || "").trim(),
-        images: buildImages(p)
+        images: buildImages(p),
+        status: mapStatus(p)
       };
 
       const hash = generateHash(productData);
@@ -183,16 +242,48 @@ export default async function handler(req, res) {
         stock_quantity: productData.stock,
         description_fr: productData.description,
         images: productData.images,
+        status: productData.status,
         richmond_hash: hash,
         needs_shopify_update: hasChanged,
         last_richmond_sync: new Date().toISOString()
       });
     }
 
-    // 🚀 BULK UPSERT
-    await supabase.from("products").upsert(upserts, {
-      onConflict: "item_code"
-    });
+    /**
+     * 6. BULK UPSERT
+     */
+    if (upserts.length > 0) {
+      await supabase.from("products").upsert(upserts, {
+        onConflict: "item_code"
+      });
+    }
+
+    /**
+     * 7. HANDLE DELETED PRODUCTS (ONLY FIRST PAGE)
+     */
+    if (offset === 0) {
+      const allCodes = allProducts.map(p => p.itemCodeNew);
+
+      const { data: dbProducts } = await supabase
+        .from("products")
+        .select("item_code");
+
+      const deleted = (dbProducts || []).filter(
+        p => !allCodes.includes(p.item_code)
+      );
+
+      for (const p of deleted) {
+        await supabase
+          .from("products")
+          .update({
+            status: "archived",
+            needs_shopify_update: true
+          })
+          .eq("item_code", p.item_code);
+      }
+
+      console.log(`🗑️ Archived ${deleted.length} deleted products`);
+    }
 
     console.log(`✅ Sync done (${upserts.length} produits)`);
 
