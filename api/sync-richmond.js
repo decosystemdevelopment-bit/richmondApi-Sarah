@@ -64,23 +64,19 @@
  * ============================================================
  */
 
+
+/* New */
+
+
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 
-/**
- * 🔌 Initialisation du client Supabase
- * Utilise les variables d'environnement (sécurité)
- */
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
-/**
- * 🌐 Configuration API Richmond
- * Richmond expose plusieurs endpoints séparés (details, pricing, stock, descriptions)
- */
 const BASE = "https://www.richmondinteriors.nl/api/v1/products";
 const AUTH = process.env.RICHMOND_AUTH;
 
@@ -91,29 +87,31 @@ const API = {
   desc: `${BASE}/descriptions/${AUTH}`
 };
 
-/**
- * 🧠 Génère un hash unique du produit
- * Permet de détecter si un produit a changé (comparaison avec la DB)
- */
+const COEFF = parseFloat(process.env.PRICE_COEFF || "2.3");
+
 function generateHash(data) {
-  return crypto
-    .createHash("md5")
-    .update(JSON.stringify(data)) // stringify pour garantir une comparaison fiable
-    .digest("hex");
+  return crypto.createHash("md5").update(JSON.stringify(data)).digest("hex");
 }
 
-/**
- * 🚀 Endpoint Vercel
- * Synchronise Richmond → Supabase
- */
+function parsePrice(value) {
+  if (!value) return 0;
+  return parseFloat(value.replace(",", "."));
+}
+
+function buildImages(p) {
+  const base = p["Product Images Location"] || "";
+  return (p["Product Images"] || "")
+    .split(",")
+    .map(i => i.trim())
+    .filter(Boolean)
+    .map(i => base + i)
+    .sort();
+}
+
 export default async function handler(req, res) {
   try {
     console.log("🔄 Richmond sync...");
 
-    /**
-     * 📡 Récupération des données Richmond en parallèle
-     * Optimisation : Promise.all pour réduire le temps de réponse
-     */
     const [productsRes, pricingRes, stockRes, descRes] =
       await Promise.all([
         axios.get(API.details),
@@ -122,10 +120,6 @@ export default async function handler(req, res) {
         axios.get(API.desc)
       ]);
 
-    /**
-     * 🗺️ Transformation en maps (lookup rapide O(1))
-     * Permet d'éviter des recherches dans des tableaux (O(n))
-     */
     const pricingMap = Object.fromEntries(
       pricingRes.data.map(p => [p.itemCodeNew, p])
     );
@@ -138,101 +132,74 @@ export default async function handler(req, res) {
       descRes.data.map(d => [d.itemCodeNew, d])
     );
 
-    /**
-     * 📦 Pagination
-     * Évite les timeouts Vercel en traitant les produits par batch
-     */
     const offset = parseInt(req.query.offset || "0");
     const limit = 100;
 
-    const products = productsRes.data.slice(offset, offset + limit);
+    const batch = productsRes.data.slice(offset, offset + limit);
 
-    /**
-     * 🔁 Boucle sur chaque produit Richmond
-     */
-    for (const p of products) {
+    const codes = batch.map(p => p.itemCodeNew);
+
+    // 🔥 BULK fetch existing hashes
+    const { data: existingRows } = await supabase
+      .from("products")
+      .select("item_code, richmond_hash")
+      .in("item_code", codes);
+
+    const existingMap = Object.fromEntries(
+      (existingRows || []).map(e => [e.item_code, e])
+    );
+
+    const upserts = [];
+
+    for (const p of batch) {
       const code = p.itemCodeNew;
 
-      // 🔗 Récupération des données liées (prix, stock, description)
       const priceData = pricingMap[code];
       const stockData = stockMap[code];
       const desc = descMap[code];
 
-      /**
-       * 🧱 Reconstruction d'un objet produit "stable"
-       * Important pour garantir un hash cohérent
-       */
+      const basePrice = parsePrice(priceData?.retailPrice);
+      const finalPrice = Number((basePrice * COEFF).toFixed(2));
+
       const productData = {
-        title: p.description2 || p.description3,
-
-        // 💰 Normalisation du prix (évite 41.4 vs 41.40)
-        price: Number(
-          parseFloat(priceData?.retailPrice?.replace(",", ".") || 0).toFixed(2)
-        ),
-
-        // 📦 Stock converti en entier
-        stock: parseInt(stockData?.StockIndicator) || 0,
-
-        // 📝 Nettoyage description (évite différences invisibles)
+        title: p.description2 || p.description3 || "",
+        price: finalPrice,
+        richmond_price: basePrice,
+        stock: parseInt(stockData?.onlineAvailabilityText) || 0,
         description: (desc?.longDescriptionFR || "").trim(),
-
-        // 🖼️ Normalisation images (ordre stable)
-        images: (p["Product Images"] || "")
-          .split(",")
-          .map(i => i.trim())
-          .sort()
+        images: buildImages(p)
       };
 
-      /**
-       * 🔑 Génération du hash produit
-       */
       const hash = generateHash(productData);
+      const existing = existingMap[code];
 
-      /**
-       * 🔍 Récupération du hash existant en base
-       */
-      const { data: existing } = await supabase
-        .from("products")
-        .select("richmond_hash")
-        .eq("item_code", code)
-        .maybeSingle();
-
-      /**
-       * ⚖️ Détection de changement
-       * - nouveau produit → true
-       * - produit modifié → true
-       * - sinon → false
-       */
       const hasChanged = !existing || existing.richmond_hash !== hash;
 
-      // 🔎 Logs debug
-      console.log("Produit:", code);
-      console.log("Nouveau hash:", hash);
-      console.log("Ancien hash:", existing?.richmond_hash);
-
-      /**
-       * 💾 UPSERT (insert ou update)
-       * Met à jour les données + flag Shopify si nécessaire
-       */
-      await supabase.from("products").upsert({
+      upserts.push({
         item_code: code,
         title: productData.title,
         price: productData.price,
+        richmond_price: productData.richmond_price,
         stock_quantity: productData.stock,
         description_fr: productData.description,
         images: productData.images,
-
         richmond_hash: hash,
         needs_shopify_update: hasChanged,
         last_richmond_sync: new Date().toISOString()
-      }, {
-        onConflict: "item_code"
       });
     }
 
-    console.log("✅ Richmond sync done");
+    // 🚀 BULK UPSERT
+    await supabase.from("products").upsert(upserts, {
+      onConflict: "item_code"
+    });
 
-    return res.status(200).json({ ok: true });
+    console.log(`✅ Sync done (${upserts.length} produits)`);
+
+    return res.status(200).json({
+      ok: true,
+      processed: upserts.length
+    });
 
   } catch (err) {
     console.error("❌ Error:", err.message);
