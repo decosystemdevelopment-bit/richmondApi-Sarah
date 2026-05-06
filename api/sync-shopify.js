@@ -5,25 +5,18 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const SHOP = process.env.SHOPIFY_SHOP;
 const API_VERSION = "2024-01";
 
-/**
- * 🔑 Token
- */
 async function getAccessToken() {
   const { data, error } = await supabase.from("shopify_auth").select("access_token").single();
   if (error || !data?.access_token) throw new Error("❌ No Shopify token");
   return data.access_token;
 }
 
-/**
- * 🚀 HANDLER
- */
 export default async function handler(req, res) {
   try {
-    console.log("🚀 START SYNC (CREATE OR UPDATE)");
+    console.log("🚀 START FULL SYNC + METAFIELDS");
     const TOKEN = await getAccessToken();
     const HEADERS = { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" };
 
-    // 1. On prend le premier produit qui a besoin d'une mise à jour
     const { data: products, error } = await supabase
       .from("products")
       .select("*")
@@ -31,104 +24,92 @@ export default async function handler(req, res) {
       .limit(1);
 
     if (error) throw error;
-    if (!products || products.length === 0) {
-      return res.status(200).json({ ok: true, message: "Rien à synchroniser." });
-    }
+    if (!products || products.length === 0) return res.status(200).json({ ok: true, message: "Rien à sync." });
 
     const p = products[0];
-    console.log(`📦 Produit cible : ${p.title}`);
+    console.log(`📦 Produit : ${p.title} (${p.item_code})`);
+
+    // 1. Préparation des Metafields
+    const metafields = [
+      { namespace: "custom", key: "volume", value: String(p.volume || 0), type: "number_decimal" },
+      { namespace: "custom", key: "weight", value: String(p.weight || 0), type: "number_decimal" },
+      { namespace: "custom", key: "depth", value: String(p.depth || 0), type: "number_decimal" },
+      { namespace: "custom", key: "height", value: String(p.height || 0), type: "number_decimal" },
+      { namespace: "custom", key: "width", value: String(p.width || 0), type: "number_decimal" },
+      { namespace: "custom", key: "color_richmond", value: p.color || "N/A", type: "single_line_text_field" },
+      { namespace: "custom", key: "materials_richmond", value: JSON.stringify(p.materials ? [p.materials] : []), type: "json" }
+    ];
+
+    // 2. Construction de l'objet Produit
+    const productPayload = {
+      title: p.title,
+      body_html: p.description_fr || "",
+      vendor: "Richmond Interiors",
+      status: p.status === "archived" ? "draft" : "active",
+      images: (p.images || []).map(url => ({ src: url })),
+      metafields: metafields, // Inclus lors de la création ou mise à jour
+      variants: [{
+        sku: p.item_code,
+        price: String(p.price),
+        inventory_management: "shopify",
+        inventory_policy: "deny"
+      }]
+    };
 
     let shopifyId = p.shopify_product_id;
     let variantId = p.variant_id;
-    let actionPerfomed = "";
+    let exists = false;
 
-    /**
-     * 2. VERIFICATION / DECISION
-     */
-    let existsOnShopify = false;
+    // 3. Vérification existence
     if (shopifyId) {
       try {
         const check = await axios.get(`https://${SHOP}/admin/api/${API_VERSION}/products/${shopifyId}.json`, { headers: HEADERS });
-        existsOnShopify = true;
+        exists = true;
         variantId = check.data.product.variants[0].id;
-        console.log("🔍 Produit trouvé sur Shopify -> Mode UPDATE");
-      } catch (err) {
-        if (err.response?.status === 404) {
-          console.log("⚠️ ID invalide/inexistant sur Shopify -> Mode CREATE");
-          existsOnShopify = false;
-        } else {
-          throw err;
-        }
-      }
+      } catch (e) { exists = false; }
     }
 
-    /**
-     * 3. EXECUTION (CREATE ou UPDATE)
-     */
-    if (!existsOnShopify) {
-      // --- MODE CREATE ---
-      const createRes = await axios.post(
-        `https://${SHOP}/admin/api/${API_VERSION}/products.json`,
-        {
-          product: {
-            title: p.title,
-            body_html: p.description_fr || "",
-            vendor: "Richmond",
-            status: p.status === "archived" ? "draft" : "active",
-            variants: [{ price: String(p.price), sku: p.item_code || "" }]
-          }
-        },
-        { headers: HEADERS }
-      );
-      shopifyId = createRes.data.product.id;
-      variantId = createRes.data.product.variants[0].id;
-      actionPerfomed = "CREATED";
+    // 4. Action (Create ou Update)
+    if (!exists) {
+      console.log("➕ Création complète...");
+      const res = await axios.post(`https://${SHOP}/admin/api/${API_VERSION}/products.json`, { product: productPayload }, { headers: HEADERS });
+      shopifyId = res.data.product.id;
+      variantId = res.data.product.variants[0].id;
     } else {
-      // --- MODE UPDATE ---
-      await axios.put(
-        `https://${SHOP}/admin/api/${API_VERSION}/products/${shopifyId}.json`,
-        {
-          product: {
-            id: shopifyId,
-            title: p.title,
-            body_html: p.description_fr || "",
-            status: p.status === "archived" ? "draft" : "active"
-          }
-        },
-        { headers: HEADERS }
-      );
-
-      await axios.put(
-        `https://${SHOP}/admin/api/${API_VERSION}/variants/${variantId}.json`,
-        {
-          variant: { id: variantId, price: String(p.price) }
-        },
-        { headers: HEADERS }
-      );
-      actionPerfomed = "UPDATED";
+      console.log("✏️ Mise à jour complète...");
+      await axios.put(`https://${SHOP}/admin/api/${API_VERSION}/products/${shopifyId}.json`, { 
+        product: { id: shopifyId, ...productPayload } 
+      }, { headers: HEADERS });
     }
 
-    /**
-     * 4. UPDATE SUPABASE
-     */
-    await supabase
-      .from("products")
-      .update({
-        shopify_product_id: String(shopifyId),
-        variant_id: String(variantId),
-        needs_shopify_update: false,
-        last_shopify_sync: new Date().toISOString()
-      })
-      .eq("id", p.id);
+    // 5. Synchronisation du Stock
+    if (variantId && p.stock_quantity !== null) {
+      try {
+        const locRes = await axios.get(`https://${SHOP}/admin/api/${API_VERSION}/locations.json`, { headers: HEADERS });
+        const locationId = locRes.data.locations[0].id;
 
-    console.log(`✅ SUCCESS: Produit ${actionPerfomed}`);
+        const varRes = await axios.get(`https://${SHOP}/admin/api/${API_VERSION}/variants/${variantId}.json`, { headers: HEADERS });
+        const inventoryItemId = varRes.data.variant.inventory_item_id;
 
-    return res.status(200).json({
-      ok: true,
-      action: actionPerfomed,
-      title: p.title,
-      id: shopifyId
-    });
+        await axios.post(`https://${SHOP}/admin/api/${API_VERSION}/inventory_levels/set.json`, {
+          location_id: locationId,
+          inventory_item_id: inventoryItemId,
+          available: p.stock_quantity
+        }, { headers: HEADERS });
+        console.log(`🔢 Stock : ${p.stock_quantity}`);
+      } catch (sErr) { console.error("⚠️ Stock error:", sErr.response?.data || sErr.message); }
+    }
+
+    // 6. Update Supabase
+    await supabase.from("products").update({
+      shopify_product_id: String(shopifyId),
+      variant_id: String(variantId),
+      needs_shopify_update: false,
+      last_shopify_sync: new Date().toISOString()
+    }).eq("id", p.id);
+
+    console.log("✅ TERMINÉ");
+    return res.status(200).json({ ok: true, action: exists ? "updated" : "created" });
 
   } catch (err) {
     console.error("❌ ERREUR :");
