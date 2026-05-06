@@ -5,6 +5,104 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const SHOP = process.env.SHOPIFY_SHOP;
 const API_VERSION = "2024-01";
 
+export default async function handler(req, res) {
+  try {
+    const { data: auth } = await supabase.from("shopify_auth").select("access_token").single();
+    const HEADERS = { "X-Shopify-Access-Token": auth.access_token, "Content-Type": "application/json" };
+
+    // On réduit à 5 produits par batch pour être CERTAIN de ne pas avoir de timeout
+    const { data: products } = await supabase
+      .from("products")
+      .select("*")
+      .eq("needs_shopify_update", true)
+      .limit(5);
+
+    if (!products || products.length === 0) return res.status(200).json({ message: "DB à jour" });
+
+    const locRes = await axios.get(`https://${SHOP}/admin/api/${API_VERSION}/locations.json`, { headers: HEADERS });
+    const locationId = locRes.data.locations[0].id;
+
+    for (const p of products) {
+      try {
+        console.log(`Processing ${p.item_code}...`);
+
+        // --- PROTECTION ANTI-DOUBLON ---
+        // On demande à Shopify si le SKU existe déjà avant de faire quoi que ce soit
+        const search = await axios.get(`https://${SHOP}/admin/api/${API_VERSION}/products.json?sku=${p.item_code}`, { headers: HEADERS });
+        let shopifyId = p.shopify_product_id;
+        let variantId = p.variant_id;
+
+        if (search.data.products.length > 0) {
+          shopifyId = search.data.products[0].id;
+          variantId = search.data.products[0].variants[0].id;
+          console.log(`Found existing product for SKU ${p.item_code}`);
+        }
+
+        const payload = {
+          product: {
+            title: p.title,
+            body_html: p.description_fr || "",
+            vendor: "Richmond Interiors",
+            status: "active",
+            images: (p.images || []).map(url => ({ src: url })),
+            variants: [{
+              sku: p.item_code,
+              price: String(p.price),
+              inventory_management: "shopify"
+            }]
+          }
+        };
+
+        // Update ou Create
+        if (shopifyId) {
+          const up = await axios.put(`https://${SHOP}/admin/api/${API_VERSION}/products/${shopifyId}.json`, payload, { headers: HEADERS });
+          variantId = up.data.product.variants[0].id;
+        } else {
+          const cr = await axios.post(`https://${SHOP}/admin/api/${API_VERSION}/products.json`, payload, { headers: HEADERS });
+          shopifyId = cr.data.product.id;
+          variantId = cr.data.product.variants[0].id;
+        }
+
+        // Stock (uniquement si on a un variantId)
+        if (variantId) {
+          const varInfo = await axios.get(`https://${SHOP}/admin/api/${API_VERSION}/variants/${variantId}.json`, { headers: HEADERS });
+          const invId = varInfo.data.variant.inventory_item_id;
+          await axios.put(`https://${SHOP}/admin/api/${API_VERSION}/inventory_items/${invId}.json`, { inventory_item: { tracked: true } }, { headers: HEADERS });
+          await axios.post(`https://${SHOP}/admin/api/${API_VERSION}/inventory_levels/set.json`, {
+            location_id: locationId,
+            inventory_item_id: invId,
+            available: parseInt(p.stock_quantity || 0)
+          }, { headers: HEADERS });
+        }
+
+        // MARQUER COMME TERMINE (Indispensable pour arrêter la boucle)
+        await supabase.from("products").update({
+          shopify_product_id: String(shopifyId),
+          variant_id: String(variantId),
+          needs_shopify_update: false,
+          last_shopify_sync: new Date().toISOString()
+        }).eq("id", p.id);
+
+      } catch (e) {
+        console.error(`Error on ${p.item_code}:`, e.response?.data || e.message);
+        // SI ERREUR : On marque quand même comme false pour ne pas boucler à l'infini sur ce produit cassé
+        await supabase.from("products").update({ needs_shopify_update: false }).eq("id", p.id);
+      }
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+/*import axios from "axios";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const SHOP = process.env.SHOPIFY_SHOP;
+const API_VERSION = "2024-01";
+
 async function getAccessToken() {
   const { data, error } = await supabase.from("shopify_auth").select("access_token").single();
   if (error || !data?.access_token) throw new Error("❌ No Shopify token");
@@ -114,7 +212,7 @@ export default async function handler(req, res) {
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-}
+}*/
 /*
 fonctionne mais cinquante produit fait sauté le programme donc il se coupe
 
