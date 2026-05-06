@@ -183,7 +183,14 @@ export default async function handler(req, res) {
         const existing = existingMap[code];
 
         const hasChanged = !existing || existing.richmond_hash !== hash;
-
+        if (offset === 0 && upserts.length < 5) {
+          console.log({
+            code,
+            api_price: pricingMap[code]?.price,
+            parsed: basePrice,
+            final: finalPrice
+          });
+        }
         upserts.push({
           item_code: code,
           title: productData.title,
