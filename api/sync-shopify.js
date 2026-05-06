@@ -22,7 +22,7 @@ export default async function handler(req, res) {
       .from("products")
       .select("*")
       .eq("needs_shopify_update", true)
-      .limit(10); 
+      .limit(50); 
 
     if (error) throw error;
     if (!products || products.length === 0) return res.status(200).json({ ok: true, message: "Rien à synchroniser." });
