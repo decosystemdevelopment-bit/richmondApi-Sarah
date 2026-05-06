@@ -1,95 +1,15 @@
-/**
- * ============================================================
- *  Supabase → Shopify Sync
- * ============================================================
- *
- * Objectif :
- * Synchroniser les produits depuis Supabase vers Shopify,
- * uniquement lorsque des modifications ont été détectées
- * côté Richmond (via le flag `needs_shopify_update`).
- *
- * ------------------------------------------------------------
- * Fonctionnement global :
- *
- * 1. Récupère les produits dans Supabase avec :
- *    → needs_shopify_update = true
- *
- * 2. Pour chaque produit :
- *    - Si `shopify_product_id` existe :
- *        → UPDATE du produit sur Shopify
- *
- *    - Sinon :
- *        → CREATE du produit sur Shopify
- *
- * 3. Une fois synchronisé :
- *    - met à jour `shopify_product_id` (si création)
- *    - met `needs_shopify_update = false`
- *    - enregistre `last_shopify_sync`
- *
- * ------------------------------------------------------------
- * Batch processing :
- * Limité à 50 produits par exécution pour :
- *    - éviter les rate limits Shopify
- *    - éviter les timeouts Vercel
- *
- * ------------------------------------------------------------
- * Champs clés :
- *
- * - needs_shopify_update :
- *   Flag déclenché par le script Richmond
- *   → indique qu'un produit doit être synchronisé
- *
- * - shopify_product_id :
- *   ID du produit côté Shopify
- *   → permet de savoir si on fait un UPDATE ou CREATE
- *
- * - last_shopify_sync :
- *   Date de la dernière synchronisation Shopify
- *
- * ------------------------------------------------------------
- * Limitations actuelles :
- *
- * - Ne gère que :
- *    → title
- *    → description (body_html)
- *    → price
- *
- * - Ne gère pas encore :
- *    → stock (inventory)
- *    → images
- *    → metafields
- *    → variants avancés
- *
- * ------------------------------------------------------------
- * Résultat :
- *
- * Ce script agit comme un "worker Shopify"
- * qui applique uniquement les changements détectés
- * par le sync Richmond.
- *
- * Supabase agit comme source de vérité intermédiaire.
- *
- * ============================================================
- */
-
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 
 /**
- * 🔌 Supabase
+ * 🔌 Configuration Clients
  */
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
-
-/**
- * 🛒 Shopify
- */
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const SHOP = process.env.SHOPIFY_SHOP;
+const API_VERSION = "2024-01"; // Version stable recommandée
 
 /**
- * 🔑 Get token
+ * 🔑 Récupération du Token Shopify depuis Supabase
  */
 async function getAccessToken() {
   const { data, error } = await supabase
@@ -97,99 +17,58 @@ async function getAccessToken() {
     .select("access_token")
     .single();
 
-  if (error || !data?.access_token) {
-    throw new Error("❌ No Shopify token");
-  }
-
+  if (error || !data?.access_token) throw new Error("❌ No Shopify token in DB");
   return data.access_token;
 }
 
 /**
- * ⏱️ Sleep
- */
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * 🧠 Status mapping
- */
-function mapStatus(status) {
-  return status === "archived" ? "draft" : "active";
-}
-
-/**
- * 🔍 Fetch variant ID
+ * 🔍 Récupérer l'ID du premier variant d'un produit Shopify
  */
 async function fetchVariantId(productId, headers) {
-  const res = await axios.get(
-    `https://${SHOP}/admin/api/2026-04/products/${productId}.json`,
-    { headers }
-  );
-
-  return res.data.product?.variants?.[0]?.id;
+  try {
+    const res = await axios.get(
+      `https://${SHOP}/admin/api/${API_VERSION}/products/${productId}.json`,
+      { headers }
+    );
+    return res.data.product?.variants?.[0]?.id;
+  } catch (error) {
+    console.error(`❌ Error fetching variant for product ${productId}`);
+    return null;
+  }
 }
 
 /**
- * ➕ CREATE
- */
-async function createProduct(p, headers) {
-  const res = await axios.post(
-    `https://${SHOP}/admin/api/2026-04/products.json`,
-    {
-      product: {
-        title: p.title,
-        body_html: p.description_fr,
-        status: mapStatus(p.status),
-        variants: [
-          {
-            price: String(p.price)
-          }
-        ]
-      }
-    },
-    { headers }
-  );
-
-  return {
-    id: res.data.product.id,
-    variantId: res.data.product.variants?.[0]?.id
-  };
-}
-
-/**
- * 🔄 UPDATE
+ * 🔄 UPDATE : Mise à jour Titre, Description, Statut et Prix
  */
 async function updateProduct(p, headers) {
   const productId = p.shopify_product_id;
   let variantId = p.variant_id;
 
-  if (!productId) throw new Error("Missing productId");
-
-  // 🔥 récupérer variant si absent
+  // Si on n'a pas le variant_id en DB, on va le chercher chez Shopify
   if (!variantId) {
-    console.log("🔍 Fetch variant...");
+    console.log(`🔍 Variant ID manquant pour ${productId}, récupération...`);
     variantId = await fetchVariantId(productId, headers);
-    console.log("✅ Variant:", variantId);
   }
 
-  // update product
+  if (!variantId) throw new Error(`Impossible de trouver un variant pour le produit ${productId}`);
+
+  // 1. Update du produit (Titre, Body, Status)
   await axios.put(
-    `https://${SHOP}/admin/api/2026-04/products/${productId}.json`,
+    `https://${SHOP}/admin/api/${API_VERSION}/products/${productId}.json`,
     {
       product: {
         id: productId,
         title: p.title,
         body_html: p.description_fr,
-        status: mapStatus(p.status)
+        status: p.status === "archived" ? "draft" : "active"
       }
     },
     { headers }
   );
 
-  // update price
+  // 2. Update du prix sur le variant
   await axios.put(
-    `https://${SHOP}/admin/api/2026-04/variants/${variantId}.json`,
+    `https://${SHOP}/admin/api/${API_VERSION}/variants/${variantId}.json`,
     {
       variant: {
         id: variantId,
@@ -199,128 +78,90 @@ async function updateProduct(p, headers) {
     { headers }
   );
 
-  console.log("💰 Price updated:", p.price);
-
   return variantId;
 }
 
 /**
- * 🔢 Count remaining
- */
-async function countRemaining() {
-  const { count } = await supabase
-    .from("products")
-    .select("*", { count: "exact", head: true })
-    .eq("needs_shopify_update", true);
-
-  return count || 0;
-}
-
-/**
- * 🚀 HANDLER
+ * 🚀 HANDLER PRINCIPAL (Vercel)
  */
 export default async function handler(req, res) {
   try {
-    console.log("🛒 START SHOPIFY SYNC");
-    console.log("🏪 SHOP:", SHOP);
-
+    console.log("---------------------------------------");
+    console.log("🛒 START SHOPIFY SYNC (TEST MODE)");
+    
     const TOKEN = await getAccessToken();
-
     const HEADERS = {
       "X-Shopify-Access-Token": TOKEN,
       "Content-Type": "application/json"
     };
 
     /**
-     * 1. FETCH (juste 1 pour debug)
+     * 1. FETCH PRODUIT
+     * On filtre explicitement pour ignorer les ID null (ton souhait pour le test)
      */
     const { data: products, error } = await supabase
       .from("products")
       .select("*")
       .eq("needs_shopify_update", true)
+      .not("shopify_product_id", "is", null) // 🔥 On ignore les "null"
       .limit(1);
 
     if (error) throw error;
 
     if (!products || products.length === 0) {
-      return res.status(200).json({
-        ok: true,
-        message: "Nothing to sync"
-      });
+      console.log("ℹ️ Aucun produit avec shopify_product_id trouvé pour la sync.");
+      return res.status(200).json({ ok: true, message: "Nothing to sync (filtered)" });
     }
 
     const p = products[0];
+    console.log(`📦 Processing Product: ${p.title} (ID: ${p.shopify_product_id})`);
 
     /**
-     * 🔥 TEST SHOPIFY (ULTRA IMPORTANT)
+     * 2. TEST DE CONNEXION (Optionnel mais sécurisé)
      */
-    console.log("🧪 TEST PRODUCT ID:", p.shopify_product_id);
-
     try {
-      const test = await axios.get(
-        `https://${SHOP}/admin/api/2026-04/products/${p.shopify_product_id}.json`,
+      await axios.get(
+        `https://${SHOP}/admin/api/${API_VERSION}/products/${p.shopify_product_id}.json`,
         { headers: HEADERS }
       );
-
-      console.log("✅ TEST SUCCESS → Product accessible");
-
+      console.log("✅ Shopify API: Connection OK");
     } catch (err) {
-      console.error("❌ TEST FAILED");
-
-      if (err.response) {
-        console.error("🔥 SHOPIFY:", err.response.data);
-      } else {
-        console.error(err.message);
-      }
-
-      return res.status(500).json({
-        error: "Shopify test failed"
-      });
+      console.error("❌ Shopify API: Product ID not found on store.");
+      return res.status(404).json({ error: "Product ID exists in DB but not in Shopify" });
     }
 
     /**
-     * 🔄 SYNC NORMAL (1 produit pour test)
+     * 3. EXECUTION DE L'UPDATE
      */
-    let shopifyId = p.shopify_product_id;
-    let variantId = p.variant_id;
-
-    if (!shopifyId) {
-      console.log("➕ CREATE");
-
-      const created = await createProduct(p, HEADERS);
-      shopifyId = created.id;
-      variantId = created.variantId;
-
-    } else {
-      console.log("✏️ UPDATE");
-
-      variantId = await updateProduct(p, HEADERS);
-    }
+    console.log("✏️ Updating Shopify...");
+    const finalVariantId = await updateProduct(p, HEADERS);
 
     /**
-     * UPDATE DB
+     * 4. MISE À JOUR SUPABASE
      */
     await supabase
       .from("products")
       .update({
-        shopify_product_id: shopifyId,
-        variant_id: variantId,
+        variant_id: finalVariantId,
         needs_shopify_update: false,
         last_shopify_sync: new Date().toISOString()
       })
       .eq("id", p.id);
 
-    console.log("✅ DONE");
+    console.log("✅ SYNC SUCCESSFUL");
+    console.log("---------------------------------------");
 
     return res.status(200).json({
-      ok: true
+      success: true,
+      product: p.title,
+      shopify_id: p.shopify_product_id
     });
 
   } catch (err) {
-    console.error("❌ GLOBAL ERROR:", err.message);
-
+    console.error("❌ GLOBAL ERROR:", err.response?.data || err.message);
     return res.status(500).json({
-      error: err.message
+      error: err.message,
+      details: err.response?.data || "No details"
     });
   }
 }
