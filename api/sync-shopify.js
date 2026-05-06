@@ -81,8 +81,17 @@ const supabase = createClient(
 );
 
 const SHOP = process.env.SHOPIFY_SHOP;
-const TOKEN = process.env.SHOPIFY_TOKEN;
+//const TOKEN = process.env.SHOPIFY_TOKEN;
+async function getAccessToken() {
+  const { data } = await supabase
+    .from("shopify_auth")
+    .select("access_token")
+    .single();
 
+  return data?.access_token;
+}
+
+const TOKEN = await getAccessToken();
 const HEADERS = {
   "X-Shopify-Access-Token": TOKEN,
   "Content-Type": "application/json"
