@@ -1,4 +1,4 @@
-// correctif stock
+// correctif stock, variant_id manquant
 
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
@@ -15,11 +15,11 @@ async function getAccessToken() {
 
 export default async function handler(req, res) {
   try {
-    console.log("🚀 TEST SYNC : Correction Stock pour Oravelle");
+    console.log("🚀 SYNC STOCK : Récupération du Variant ID manquant...");
     const TOKEN = await getAccessToken();
     const HEADERS = { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" };
 
-    // 1. Sélection du produit
+    // 1. Sélection du produit Oravelle
     const { data: p, error } = await supabase
       .from("products")
       .select("*")
@@ -27,40 +27,48 @@ export default async function handler(req, res) {
       .single();
 
     if (error || !p) throw new Error("Produit non trouvé");
+    if (!p.shopify_product_id) throw new Error("Le shopify_product_id est manquant. Création requise d'abord.");
 
-    let shopifyId = p.shopify_product_id;
     let variantId = p.variant_id;
 
-    // 2. Récupération du Variant et de l'Inventory Item chez Shopify
-    // C'est l'étape cruciale pour débloquer le stock
-    if (!variantId) throw new Error("Le variant_id est manquant dans Supabase");
+    // 2. RÉCUPÉRATION SI MANQUANT
+    if (!variantId) {
+      console.log(`🔍 Variant ID manquant en DB pour ${p.shopify_product_id}. Récupération chez Shopify...`);
+      const prodRes = await axios.get(
+        `https://${SHOP}/admin/api/${API_VERSION}/products/${p.shopify_product_id}.json`,
+        { headers: HEADERS }
+      );
+      
+      // On prend le premier variant trouvé
+      variantId = prodRes.data.product.variants[0].id;
+      
+      // On enregistre tout de suite en DB pour ne plus avoir l'erreur
+      await supabase.from("products")
+        .update({ variant_id: String(variantId) })
+        .eq("id", p.id);
+        
+      console.log(`✅ Variant ID trouvé (${variantId}) et enregistré dans Supabase.`);
+    }
 
-    console.log(`🔍 Vérification de l'inventaire pour le variant ${variantId}...`);
-    
+    // 3. RÉCUPÉRATION DE L'INVENTAIRE ITEM
     const varRes = await axios.get(
       `https://${SHOP}/admin/api/${API_VERSION}/variants/${variantId}.json`, 
       { headers: HEADERS }
     );
-    
     const inventoryItemId = varRes.data.variant.inventory_item_id;
 
-    // 3. ACTIVER LE SUIVI (Tracked)
-    // On s'assure que Shopify accepte de gérer le stock pour cet article
+    // 4. FORCER LE SUIVI (Tracked)
     await axios.put(
       `https://${SHOP}/admin/api/${API_VERSION}/inventory_items/${inventoryItemId}.json`, 
       { inventory_item: { tracked: true } }, 
       { headers: HEADERS }
     );
 
-    // 4. RÉCUPÉRER LE LOCATION ID
+    // 5. RÉCUPÉRER LOCATION ET METTRE À JOUR STOCK
     const locRes = await axios.get(`https://${SHOP}/admin/api/${API_VERSION}/locations.json`, { headers: HEADERS });
     const locationId = locRes.data.locations[0].id;
 
-    // 5. MISE À JOUR DU STOCK RÉEL
-    // On utilise stock_quantity (20) et non stock (1)
     const realStock = parseInt(p.stock_quantity || 0);
-
-    console.log(`🔢 Mise à jour du stock : ${realStock} unités sur la location ${locationId}`);
 
     await axios.post(
       `https://${SHOP}/admin/api/${API_VERSION}/inventory_levels/set.json`, 
@@ -72,27 +80,22 @@ export default async function handler(req, res) {
       { headers: HEADERS }
     );
 
-    // 6. MAJ SUPABASE
+    // 6. FINALISATION
     await supabase.from("products").update({
       needs_shopify_update: false,
       last_shopify_sync: new Date().toISOString()
     }).eq("id", p.id);
 
-    console.log("✅ STOCK MIS À JOUR AVEC SUCCÈS");
+    console.log(`✅ SUCCÈS : Stock mis à jour (${realStock} unités)`);
     
-    return res.status(200).json({ 
-      ok: true, 
-      item: p.item_code,
-      stock_synced: realStock 
-    });
+    return res.status(200).json({ ok: true, variant_id_recovered: variantId, stock: realStock });
 
   } catch (err) {
-    console.error("❌ ERREUR STOCK :");
+    console.error("❌ ERREUR :");
     console.error(err.response?.data || err.message);
     return res.status(500).json({ error: err.message, details: err.response?.data });
   }
 }
-
 /*
 
 celui la est parfait excepté le stock.
