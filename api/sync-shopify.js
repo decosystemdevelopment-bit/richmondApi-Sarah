@@ -71,6 +71,7 @@
  *
  * ============================================================
  */
+
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 
@@ -108,15 +109,15 @@ function mapStatus(status) {
 }
 
 /**
- * 🔍 Get first variant ID (IMPORTANT)
+ * 🔢 Count remaining products
  */
-async function getVariantId(productId) {
-  const res = await axios.get(
-    `https://${SHOP}/admin/api/2025-01/products/${productId}.json`,
-    { headers: HEADERS }
-  );
+async function countRemaining() {
+  const { count } = await supabase
+    .from("products")
+    .select("*", { count: "exact", head: true })
+    .eq("needs_shopify_update", true);
 
-  return res.data.product.variants?.[0]?.id;
+  return count || 0;
 }
 
 /**
@@ -140,20 +141,22 @@ async function createProduct(p) {
     { headers: HEADERS }
   );
 
+  const product = res.data.product;
+
   return {
-    id: res.data.product.id,
-    variantId: res.data.product.variants?.[0]?.id
+    id: product.id,
+    variantId: product.variants?.[0]?.id
   };
 }
 
 /**
  * 🔄 UPDATE PRODUCT
  */
-async function updateProduct(productId, p) {
-  // 1. récupérer le variant ID
-  const variantId = await getVariantId(productId);
+async function updateProduct(p) {
+  const productId = p.shopify_product_id;
+  const variantId = p.variant_id;
 
-  // 2. update produit
+  // 1. Update product (title, desc, status)
   await axios.put(
     `https://${SHOP}/admin/api/2025-01/products/${productId}.json`,
     {
@@ -167,7 +170,7 @@ async function updateProduct(productId, p) {
     { headers: HEADERS }
   );
 
-  // 3. update variant (price)
+  // 2. Update price
   if (variantId) {
     await axios.put(
       `https://${SHOP}/admin/api/2025-01/variants/${variantId}.json`,
@@ -179,6 +182,8 @@ async function updateProduct(productId, p) {
       },
       { headers: HEADERS }
     );
+  } else {
+    console.warn(`⚠️ Missing variant_id for product ${p.item_code}`);
   }
 }
 
@@ -202,26 +207,35 @@ export default async function handler(req, res) {
 
     if (!products || products.length === 0) {
       console.log("✅ Nothing to sync");
-      return res.status(200).json({ ok: true, message: "Nothing to sync" });
+      return res.status(200).json({
+        ok: true,
+        message: "Nothing to sync",
+        remaining: 0
+      });
     }
 
     /**
      * 2. LOOP
      */
+    let processed = 0;
+
     for (const p of products) {
       try {
         let shopifyId = p.shopify_product_id;
+        let variantId = p.variant_id;
 
         if (!shopifyId) {
           console.log("➕ Creating:", p.title);
 
           const created = await createProduct(p);
+
           shopifyId = created.id;
+          variantId = created.variantId;
 
         } else {
           console.log("🔄 Updating:", p.title);
 
-          await updateProduct(shopifyId, p);
+          await updateProduct(p);
         }
 
         /**
@@ -231,30 +245,34 @@ export default async function handler(req, res) {
           .from("products")
           .update({
             shopify_product_id: shopifyId,
+            variant_id: variantId, // 🔥 important
             needs_shopify_update: false,
             last_shopify_sync: new Date().toISOString()
           })
           .eq("id", p.id);
 
+        processed++;
+
         /**
-         * ⏱️ Anti rate-limit
+         * ⏱️ Anti rate-limit Shopify
          */
-        await sleep(500);
+        await sleep(600);
 
       } catch (err) {
         console.error("❌ Product error:", p.item_code);
         console.error(err.response?.data || err.message);
-
-        // ⚠️ ne pas bloquer toute la boucle
         continue;
       }
     }
 
-    console.log("✅ Shopify sync done");
+    const remaining = await countRemaining();
+
+    console.log(`✅ Done: ${processed}, Remaining: ${remaining}`);
 
     return res.status(200).json({
       ok: true,
-      processed: products.length
+      processed,
+      remaining
     });
 
   } catch (err) {
