@@ -13,12 +13,11 @@ async function getAccessToken() {
 
 export default async function handler(req, res) {
   try {
-    console.log("🚀 DEMARRAGE DU TEST SYNC (1 PRODUIT EXISANT)");
-    
+    console.log("🚀 DEMARRAGE DU TEST SYNC");
     const TOKEN = await getAccessToken();
     const HEADERS = { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" };
 
-    // 1. Récupération du produit avec les logs détaillés
+    // 1. Récupération du produit
     const { data: products, error } = await supabase
       .from("products")
       .select("*")
@@ -28,78 +27,69 @@ export default async function handler(req, res) {
 
     if (error) throw error;
     if (!products || products.length === 0) {
-      return res.status(200).json({ ok: true, message: "Aucun produit trouvé avec un ID Shopify." });
+      return res.status(200).json({ ok: true, message: "Aucun produit à mettre à jour." });
     }
 
     const p = products[0];
+    console.log(`🔍 ESSAI SUR : ${p.title} (ID Shopify: ${p.shopify_product_id})`);
 
-    // --- AFFICHAGE DES DETAILS DANS LA CONSOLE ---
-    console.log("---------------------------------------");
-    console.log("🔍 DÉTAILS DU PRODUIT À SYNCHRONISER :");
-    console.log(`- ID Interne : ${p.id}`);
-    console.log(`- ID Shopify : ${p.shopify_product_id}`);
-    console.log(`- Titre      : ${p.title}`);
-    console.log(`- Prix       : ${p.price}€`);
-    console.log(`- Statut DB  : ${p.status}`);
-    console.log(`- Variant ID : ${p.variant_id || "Non spécifié (sera cherché)"}`);
-    console.log("---------------------------------------");
+    try {
+      // 2. Tentative de récupération chez Shopify
+      const shopifyCheck = await axios.get(
+        `https://${SHOP}/admin/api/${API_VERSION}/products/${p.shopify_product_id}.json`,
+        { headers: HEADERS }
+      );
 
-    // 2. Test d'accessibilité chez Shopify
-    console.log("🧪 Vérification de l'ID chez Shopify...");
-    const shopifyCheck = await axios.get(
-      `https://${SHOP}/admin/api/${API_VERSION}/products/${p.shopify_product_id}.json`,
-      { headers: HEADERS }
-    );
-    console.log("✅ Produit trouvé sur Shopify.");
+      const variantId = p.variant_id || shopifyCheck.data.product.variants[0].id;
 
-    // On récupère le variant ID réel depuis Shopify si celui en DB est faux/vide
-    const variantId = p.variant_id || shopifyCheck.data.product.variants[0].id;
+      // 3. Update Shopify
+      console.log(`✏️ Envoi de l'update...`);
+      await axios.put(
+        `https://${SHOP}/admin/api/${API_VERSION}/products/${p.shopify_product_id}.json`,
+        { product: { id: p.shopify_product_id, title: p.title, body_html: p.description_fr } },
+        { headers: HEADERS }
+      );
 
-    // 3. Mise à jour Shopify
-    console.log(`✏️ Envoi de l'update (Prix: ${p.price})...`);
-    
-    // Update Produit (Titre + Description)
-    await axios.put(
-      `https://${SHOP}/admin/api/${API_VERSION}/products/${p.shopify_product_id}.json`,
-      { product: { id: p.shopify_product_id, title: p.title, body_html: p.description_fr } },
-      { headers: HEADERS }
-    );
+      await axios.put(
+        `https://${SHOP}/admin/api/${API_VERSION}/variants/${variantId}.json`,
+        { variant: { id: variantId, price: String(p.price) } },
+        { headers: HEADERS }
+      );
 
-    // Update Variant (Prix)
-    await axios.put(
-      `https://${SHOP}/admin/api/${API_VERSION}/variants/${variantId}.json`,
-      { variant: { id: variantId, price: String(p.price) } },
-      { headers: HEADERS }
-    );
+      // 4. Update Supabase - Succès
+      await supabase
+        .from("products")
+        .update({
+          variant_id: variantId,
+          needs_shopify_update: false,
+          last_shopify_sync: new Date().toISOString()
+        })
+        .eq("id", p.id);
 
-    // 4. Mise à jour Supabase
-    await supabase
-      .from("products")
-      .update({
-        variant_id: variantId,
-        needs_shopify_update: false,
-        last_shopify_sync: new Date().toISOString()
-      })
-      .eq("id", p.id);
+      console.log("✅ SYNC RÉUSSIE");
+      return res.status(200).json({ ok: true, updated: p.title });
 
-    console.log("✅ SYNCHRONISATION RÉUSSIE");
+    } catch (err) {
+      // 🔥 GESTION DU "NOT FOUND"
+      if (err.response && err.response.status === 404) {
+        console.error(`⚠️ Le produit ${p.shopify_product_id} n'existe pas sur Shopify. Désactivation du flag.`);
+        
+        // On remet needs_shopify_update à false pour ne pas bloquer le script sur ce produit
+        await supabase
+          .from("products")
+          .update({ 
+            needs_shopify_update: false,
+            shopify_product_id: null // Optionnel : on reset l'ID s'il est mort
+          })
+          .eq("id", p.id);
 
-    return res.status(200).json({
-      status: "success",
-      details: {
-        title: p.title,
-        shopify_id: p.shopify_product_id,
-        new_price: p.price
+        return res.status(404).json({ error: "Produit non trouvé sur Shopify, flag désactivé." });
       }
-    });
+      throw err; // Relance l'erreur si c'est autre chose qu'un 404
+    }
 
   } catch (err) {
-    console.error("❌ ERREUR :");
-    if (err.response) {
-      console.error(JSON.stringify(err.response.data, null, 2));
-    } else {
-      console.error(err.message);
-    }
+    console.error("❌ ERREUR GLOBALE:", err.message);
     return res.status(500).json({ error: err.message });
   }
 }
