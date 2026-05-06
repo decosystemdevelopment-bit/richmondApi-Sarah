@@ -8,6 +8,7 @@ const GQL_URL = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
 
 export default async function handler(req, res) {
   try {
+    // 1. Récupération du token
     const { data: auth, error: authError } = await supabase
       .from("shopify_auth")
       .select("access_token")
@@ -22,6 +23,7 @@ export default async function handler(req, res) {
       "Content-Type": "application/json",
     };
 
+    // 2. Produits à synchroniser
     const { data: products, error: dbError } = await supabase
       .from("products")
       .select("id, item_code, price, shopify_product_id")
@@ -40,7 +42,7 @@ export default async function handler(req, res) {
       const newPrice = parseFloat(p.price);
 
       try {
-        // 1. Recherche de la variante par SKU via GraphQL
+        // 3. Recherche de la variante par SKU (avec productId)
         const searchRes = await axios.post(
           GQL_URL,
           {
@@ -51,6 +53,9 @@ export default async function handler(req, res) {
                     id
                     price
                     sku
+                    product {
+                      id
+                    }
                   }
                 }
               }
@@ -65,62 +70,86 @@ export default async function handler(req, res) {
           console.warn(`⚠️ [${sku}] SKU introuvable sur Shopify.`);
           await supabase
             .from("products")
-            .update({ sync_error: "SKU introuvable", last_shopify_sync: new Date().toISOString() })
+            .update({
+              sync_error: "SKU introuvable",
+              last_shopify_sync: new Date().toISOString(),
+            })
             .eq("id", p.id);
           results.push({ sku, status: "skipped", reason: "SKU introuvable" });
           continue;
         }
 
         const variant = edges[0].node;
-        const variantGid = variant.id; // ex: "gid://shopify/ProductVariant/123456"
+        const variantGid = variant.id;
+        const productGid = variant.product.id;
         const oldPrice = parseFloat(variant.price);
 
         console.log(`--- [${sku}] ---`);
         console.log(`Ancien prix Shopify : ${oldPrice}€`);
         console.log(`Prix Supabase       : ${newPrice}€`);
 
-        // 2. Mise à jour uniquement si le prix a changé
-        if (oldPrice !== newPrice) {
-          const mutationRes = await axios.post(
-            GQL_URL,
-            {
-              query: `
-                mutation productVariantUpdate($input: ProductVariantInput!) {
-                  productVariantUpdate(input: $input) {
-                    productVariant {
-                      id
-                      price
-                    }
-                    userErrors {
-                      field
-                      message
-                    }
+        if (oldPrice === newPrice) {
+          console.log(`Statut              : ✨ Prix identique, update ignoré`);
+          await supabase
+            .from("products")
+            .update({
+              needs_shopify_update: false,
+              sync_error: null,
+              last_shopify_sync: new Date().toISOString(),
+            })
+            .eq("id", p.id);
+          results.push({ sku, status: "skipped", reason: "Prix identique" });
+          continue;
+        }
+
+        // 4. Mise à jour via productVariantsBulkUpdate
+        const mutationRes = await axios.post(
+          GQL_URL,
+          {
+            query: `
+              mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+                productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+                  productVariants {
+                    id
+                    price
+                  }
+                  userErrors {
+                    field
+                    message
                   }
                 }
-              `,
-              variables: {
-                input: {
+              }
+            `,
+            variables: {
+              productId: productGid,
+              variants: [
+                {
                   id: variantGid,
                   price: String(newPrice),
                 },
-              },
+              ],
             },
-            { headers: HEADERS }
-          );
+          },
+          { headers: HEADERS }
+        );
 
-          const userErrors = mutationRes.data?.data?.productVariantUpdate?.userErrors;
-          if (userErrors && userErrors.length > 0) {
-            throw new Error(userErrors.map((e) => e.message).join(", "));
-          }
-
-          console.log(`Statut              : ✅ Prix mis à jour (${oldPrice}€ → ${newPrice}€)`);
-          results.push({ sku, status: "updated", oldPrice, newPrice });
-        } else {
-          console.log(`Statut              : ✨ Prix identique, update ignoré`);
-          results.push({ sku, status: "skipped", reason: "Prix identique" });
+        // 5. Vérification des userErrors
+        const userErrors = mutationRes.data?.data?.productVariantsBulkUpdate?.userErrors;
+        if (userErrors && userErrors.length > 0) {
+          throw new Error(userErrors.map((e) => `${e.field}: ${e.message}`).join(", "));
         }
 
-        // 3. Marquer comme synchronisé dans Supabase
+        // 6. Vérification que le prix a bien changé dans la réponse
+        const updatedVariant = mutationRes.data?.data?.productVariantsBulkUpdate?.productVariants?.[0];
+        const confirmedPrice = updatedVariant ? parseFloat(updatedVariant.price) : null;
+
+        if (confirmedPrice !== null && confirmedPrice !== newPrice) {
+          throw new Error(`Prix non appliqué : Shopify retourne ${confirmedPrice}€ au lieu de ${newPrice}€`);
+        }
+
+        console.log(`Statut              : ✅ Prix mis à jour (${oldPrice}€ → ${newPrice}€)`);
+
+        // 7. Mise à jour Supabase (succès)
         await supabase
           .from("products")
           .update({
@@ -129,6 +158,8 @@ export default async function handler(req, res) {
             last_shopify_sync: new Date().toISOString(),
           })
           .eq("id", p.id);
+
+        results.push({ sku, status: "updated", oldPrice, newPrice, confirmedPrice });
 
       } catch (err) {
         const errMsg = err.response?.data
@@ -153,4 +184,3 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: err.message });
   }
 }
-
