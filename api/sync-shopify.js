@@ -227,6 +227,7 @@ async function countRemaining() {
 export default async function handler(req, res) {
   try {
     console.log("🛒 START SHOPIFY SYNC");
+    console.log("SHOP:", SHOP);
 
     const TOKEN = await getAccessToken();
 
