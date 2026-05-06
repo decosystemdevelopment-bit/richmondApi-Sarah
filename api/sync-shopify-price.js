@@ -10,62 +10,59 @@ export default async function handler(req, res) {
     const { data: auth } = await supabase.from("shopify_auth").select("access_token").single();
     const HEADERS = { "X-Shopify-Access-Token": auth.access_token, "Content-Type": "application/json" };
 
-    // Sélection des produits nécessitant une mise à jour de prix
-    const { data: products } = await supabase
+    // On utilise ta colonne 'needs_shopify_update'
+    const { data: products, error: dbError } = await supabase
       .from("products")
-      .select("id, item_code, price, variant_id")
-      .eq("needs_price_update", true)
-      .limit(25);
+      .select("id, item_code, price, shopify_product_id")
+      .eq("needs_shopify_update", true) 
+      .limit(20);
 
-    if (!products || products.length === 0) return res.status(200).json({ message: "Aucun prix à modifier" });
+    if (dbError) throw dbError;
+    if (!products || products.length === 0) return res.status(200).json({ message: "Rien à synchroniser" });
 
     for (const p of products) {
       try {
-        let vId = (p.variant_id && p.variant_id !== "null") ? p.variant_id : null;
+        let sId = p.shopify_product_id;
+        let vId = null;
 
-        // 1. Si on n'a pas l'ID de variante, on le récupère via le SKU
-        if (!vId) {
-          const checkSku = await axios.get(
-            `https://${SHOP}/admin/api/${API_VERSION}/variants.json?sku=${encodeURIComponent(p.item_code)}`, 
-            { headers: HEADERS }
-          );
-          if (checkSku.data.variants?.length > 0) {
-            vId = checkSku.data.variants[0].id;
-          }
-        }
+        // 1. Récupération des infos de la variante sur Shopify
+        // On passe par le SKU car c'est le plus fiable pour trouver la variante
+        const checkSku = await axios.get(
+          `https://${SHOP}/admin/api/${API_VERSION}/variants.json?sku=${encodeURIComponent(p.item_code)}`, 
+          { headers: HEADERS }
+        );
 
-        if (vId) {
-          // 2. RÉCUPÉRATION DU PRIX ACTUEL SUR SHOPIFY (pour le log)
-          const currentVariantRes = await axios.get(
-            `https://${SHOP}/admin/api/${API_VERSION}/variants/${vId}.json`, 
-            { headers: HEADERS }
-          );
-          const oldPriceShopify = currentVariantRes.data.variant.price;
-          const newPriceSupabase = String(p.price);
+        if (checkSku.data.variants && checkSku.data.variants.length > 0) {
+          const variant = checkSku.data.variants[0];
+          vId = variant.id;
+          const oldPrice = variant.price;
+          const newPrice = String(p.price);
 
-          // 3. MISE À JOUR SI DIFFÉRENT (Optimisation)
-          if (oldPriceShopify !== newPriceSupabase) {
+          // 2. Log de comparaison
+          console.log(`--- [${p.item_code}] ---`);
+          console.log(`Ancien prix Shopify : ${oldPrice}€`);
+          console.log(`Prix Supabase       : ${newPrice}€`);
+
+          if (oldPrice !== newPrice) {
+            // 3. Mise à jour du prix
             await axios.put(`https://${SHOP}/admin/api/${API_VERSION}/variants/${vId}.json`, {
-              variant: { id: vId, price: newPriceSupabase }
+              variant: { id: vId, price: newPrice }
             }, { headers: HEADERS });
-
-            console.log(`💰 [${p.item_code}] SYNC PRIX :`);
-            console.log(`   - Ancien prix Shopify : ${oldPriceShopify}€`);
-            console.log(`   - Prix dans Supabase   : ${newPriceSupabase}€`);
-            console.log(`   - Statut              : ✅ Mis à jour`);
+            console.log(`Statut              : ✅ Prix mis à jour`);
           } else {
-            console.log(`✨ [${p.item_code}] Déjà à jour (${oldPriceShopify}€)`);
+            console.log(`Statut              : ✨ Prix déjà identique, update ignoré`);
           }
 
-          // 4. Mise à jour Supabase pour libérer la file
+          // 4. Mise à jour Supabase (Succès)
           await supabase.from("products").update({ 
-            variant_id: String(vId),
-            needs_price_update: false 
+            needs_shopify_update: false,
+            last_shopify_sync: new Date().toISOString()
           }).eq("id", p.id);
 
         } else {
-          console.log(`⚠️ [${p.item_code}] SKU introuvable sur Shopify. Impossible de mettre à jour le prix.`);
-          await supabase.from("products").update({ needs_price_update: false }).eq("id", p.id);
+          console.log(`⚠️ [${p.item_code}] SKU introuvable sur Shopify.`);
+          // On marque false pour ne pas bloquer la file d'attente
+          await supabase.from("products").update({ needs_shopify_update: false }).eq("id", p.id);
         }
 
       } catch (err) {
