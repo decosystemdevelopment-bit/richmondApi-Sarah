@@ -1,3 +1,102 @@
+// correctif stock
+
+import axios from "axios";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const SHOP = process.env.SHOPIFY_SHOP;
+const API_VERSION = "2024-01";
+
+async function getAccessToken() {
+  const { data, error } = await supabase.from("shopify_auth").select("access_token").single();
+  if (error || !data?.access_token) throw new Error("❌ No Shopify token");
+  return data.access_token;
+}
+
+export default async function handler(req, res) {
+  try {
+    console.log("🚀 TEST SYNC : Correction Stock pour Oravelle");
+    const TOKEN = await getAccessToken();
+    const HEADERS = { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" };
+
+    // 1. Sélection du produit
+    const { data: p, error } = await supabase
+      .from("products")
+      .select("*")
+      .eq("id", "00136d52-fc0e-48f8-b50b-769f5c10fe3f") 
+      .single();
+
+    if (error || !p) throw new Error("Produit non trouvé");
+
+    let shopifyId = p.shopify_product_id;
+    let variantId = p.variant_id;
+
+    // 2. Récupération du Variant et de l'Inventory Item chez Shopify
+    // C'est l'étape cruciale pour débloquer le stock
+    if (!variantId) throw new Error("Le variant_id est manquant dans Supabase");
+
+    console.log(`🔍 Vérification de l'inventaire pour le variant ${variantId}...`);
+    
+    const varRes = await axios.get(
+      `https://${SHOP}/admin/api/${API_VERSION}/variants/${variantId}.json`, 
+      { headers: HEADERS }
+    );
+    
+    const inventoryItemId = varRes.data.variant.inventory_item_id;
+
+    // 3. ACTIVER LE SUIVI (Tracked)
+    // On s'assure que Shopify accepte de gérer le stock pour cet article
+    await axios.put(
+      `https://${SHOP}/admin/api/${API_VERSION}/inventory_items/${inventoryItemId}.json`, 
+      { inventory_item: { tracked: true } }, 
+      { headers: HEADERS }
+    );
+
+    // 4. RÉCUPÉRER LE LOCATION ID
+    const locRes = await axios.get(`https://${SHOP}/admin/api/${API_VERSION}/locations.json`, { headers: HEADERS });
+    const locationId = locRes.data.locations[0].id;
+
+    // 5. MISE À JOUR DU STOCK RÉEL
+    // On utilise stock_quantity (20) et non stock (1)
+    const realStock = parseInt(p.stock_quantity || 0);
+
+    console.log(`🔢 Mise à jour du stock : ${realStock} unités sur la location ${locationId}`);
+
+    await axios.post(
+      `https://${SHOP}/admin/api/${API_VERSION}/inventory_levels/set.json`, 
+      {
+        location_id: locationId,
+        inventory_item_id: inventoryItemId,
+        available: realStock
+      }, 
+      { headers: HEADERS }
+    );
+
+    // 6. MAJ SUPABASE
+    await supabase.from("products").update({
+      needs_shopify_update: false,
+      last_shopify_sync: new Date().toISOString()
+    }).eq("id", p.id);
+
+    console.log("✅ STOCK MIS À JOUR AVEC SUCCÈS");
+    
+    return res.status(200).json({ 
+      ok: true, 
+      item: p.item_code,
+      stock_synced: realStock 
+    });
+
+  } catch (err) {
+    console.error("❌ ERREUR STOCK :");
+    console.error(err.response?.data || err.message);
+    return res.status(500).json({ error: err.message, details: err.response?.data });
+  }
+}
+
+/*
+
+celui la est parfait excepté le stock.
+
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 
@@ -132,3 +231,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: err.message, details: err.response?.data });
   }
 }
+*/
