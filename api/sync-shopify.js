@@ -75,17 +75,11 @@
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 
-/**
- * 🔌 Supabase
- */
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
-/**
- * 🛒 Shopify config
- */
 const SHOP = process.env.SHOPIFY_SHOP;
 const TOKEN = process.env.SHOPIFY_TOKEN;
 
@@ -94,23 +88,14 @@ const HEADERS = {
   "Content-Type": "application/json"
 };
 
-/**
- * ⏱️ Rate limit protection
- */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/**
- * 🧠 Map status → Shopify
- */
 function mapStatus(status) {
   return status === "archived" ? "draft" : "active";
 }
 
-/**
- * 🔢 Count remaining products
- */
 async function countRemaining() {
   const { count } = await supabase
     .from("products")
@@ -121,9 +106,14 @@ async function countRemaining() {
 }
 
 /**
- * ➕ CREATE PRODUCT
+ * CREATE
  */
 async function createProduct(p) {
+  console.log("➡️ CREATE PAYLOAD:", {
+    title: p.title,
+    price: p.price
+  });
+
   const res = await axios.post(
     `https://${SHOP}/admin/api/2025-01/products.json`,
     {
@@ -133,7 +123,7 @@ async function createProduct(p) {
         status: mapStatus(p.status),
         variants: [
           {
-            price: p.price.toString()
+            price: p.price?.toString()
           }
         ]
       }
@@ -141,22 +131,27 @@ async function createProduct(p) {
     { headers: HEADERS }
   );
 
-  const product = res.data.product;
+  console.log("✅ CREATED:", res.data.product.id);
 
   return {
-    id: product.id,
-    variantId: product.variants?.[0]?.id
+    id: res.data.product.id,
+    variantId: res.data.product.variants?.[0]?.id
   };
 }
 
 /**
- * 🔄 UPDATE PRODUCT
+ * UPDATE
  */
 async function updateProduct(p) {
+  console.log("➡️ UPDATE PRODUCT:", p.item_code);
+
   const productId = p.shopify_product_id;
   const variantId = p.variant_id;
 
-  // 1. Update product (title, desc, status)
+  if (!productId) {
+    throw new Error("Missing shopify_product_id");
+  }
+
   await axios.put(
     `https://${SHOP}/admin/api/2025-01/products/${productId}.json`,
     {
@@ -170,62 +165,77 @@ async function updateProduct(p) {
     { headers: HEADERS }
   );
 
-  // 2. Update price
-  if (variantId) {
-    await axios.put(
-      `https://${SHOP}/admin/api/2025-01/variants/${variantId}.json`,
-      {
-        variant: {
-          id: variantId,
-          price: p.price.toString()
-        }
-      },
-      { headers: HEADERS }
-    );
-  } else {
-    console.warn(`⚠️ Missing variant_id for product ${p.item_code}`);
+  console.log("✅ PRODUCT UPDATED:", productId);
+
+  if (!variantId) {
+    console.warn("⚠️ NO VARIANT ID → PRICE SKIPPED", p.item_code);
+    return;
   }
+
+  await axios.put(
+    `https://${SHOP}/admin/api/2025-01/variants/${variantId}.json`,
+    {
+      variant: {
+        id: variantId,
+        price: p.price?.toString()
+      }
+    },
+    { headers: HEADERS }
+  );
+
+  console.log("💰 PRICE UPDATED:", p.price);
 }
 
 /**
- * 🚀 Handler
+ * HANDLER
  */
 export default async function handler(req, res) {
   try {
-    console.log("🛒 Shopify sync...");
+    console.log("🛒 START SHOPIFY SYNC");
 
-    /**
-     * 1. FETCH produits à sync
-     */
     const { data: products, error } = await supabase
       .from("products")
       .select("*")
       .eq("needs_shopify_update", true)
+      .order("created_at", { ascending: true }) // 🔥 important
       .limit(50);
 
-    if (error) throw error;
+    if (error) {
+      console.error("❌ SUPABASE FETCH ERROR:", error);
+      throw error;
+    }
+
+    console.log(`📦 FETCHED: ${products?.length || 0}`);
 
     if (!products || products.length === 0) {
-      console.log("✅ Nothing to sync");
       return res.status(200).json({
         ok: true,
-        message: "Nothing to sync",
-        remaining: 0
+        message: "Nothing to sync"
       });
     }
 
-    /**
-     * 2. LOOP
-     */
     let processed = 0;
 
     for (const p of products) {
+      console.log("=================================");
+      console.log("🔍 PRODUCT:", p.item_code);
+      console.log("➡️ DATA:", {
+        shopify_id: p.shopify_product_id,
+        variant_id: p.variant_id,
+        price: p.price
+      });
+
       try {
+        if (!p.price || isNaN(p.price)) {
+          console.warn("⚠️ INVALID PRICE → SKIP", p.item_code);
+          continue;
+        }
+
         let shopifyId = p.shopify_product_id;
         let variantId = p.variant_id;
 
         if (!shopifyId) {
-          console.log("➕ Creating:", p.title);
+          console.log("➕ CREATING PRODUCT");
 
           const created = await createProduct(p);
 
@@ -233,41 +243,50 @@ export default async function handler(req, res) {
           variantId = created.variantId;
 
         } else {
-          console.log("🔄 Updating:", p.title);
+          console.log("🔄 UPDATING PRODUCT");
 
           await updateProduct(p);
         }
 
-        /**
-         * 3. UPDATE DB
-         */
-        await supabase
+        const { error: updateError } = await supabase
           .from("products")
           .update({
             shopify_product_id: shopifyId,
-            variant_id: variantId, // 🔥 important
+            variant_id: variantId,
             needs_shopify_update: false,
             last_shopify_sync: new Date().toISOString()
           })
           .eq("id", p.id);
 
+        if (updateError) {
+          console.error("❌ SUPABASE UPDATE ERROR:", updateError);
+        } else {
+          console.log("✅ DB UPDATED");
+        }
+
         processed++;
 
-        /**
-         * ⏱️ Anti rate-limit Shopify
-         */
         await sleep(600);
 
       } catch (err) {
-        console.error("❌ Product error:", p.item_code);
-        console.error(err.response?.data || err.message);
+        console.error("❌ PRODUCT ERROR:", p.item_code);
+
+        if (err.response) {
+          console.error("🔥 SHOPIFY ERROR:");
+          console.error(JSON.stringify(err.response.data, null, 2));
+        } else {
+          console.error("🔥 ERROR:", err.message);
+        }
+
         continue;
       }
     }
 
     const remaining = await countRemaining();
 
-    console.log(`✅ Done: ${processed}, Remaining: ${remaining}`);
+    console.log("=================================");
+    console.log(`✅ DONE: ${processed}`);
+    console.log(`📊 REMAINING: ${remaining}`);
 
     return res.status(200).json({
       ok: true,
@@ -276,7 +295,7 @@ export default async function handler(req, res) {
     });
 
   } catch (err) {
-    console.error("❌ Global error:", err.response?.data || err.message);
+    console.error("❌ GLOBAL ERROR:", err.message);
 
     return res.status(500).json({
       error: err.message
