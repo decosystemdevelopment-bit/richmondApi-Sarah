@@ -71,6 +71,7 @@
  *
  * ============================================================
  */
+
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 
@@ -83,12 +84,12 @@ const supabase = createClient(
 );
 
 /**
- * 🛒 Shopify config
+ * 🛒 Shopify
  */
 const SHOP = process.env.SHOPIFY_SHOP;
 
 /**
- * 🔑 Récupère le token dynamiquement
+ * 🔑 Get token
  */
 async function getAccessToken() {
   const { data, error } = await supabase
@@ -97,14 +98,14 @@ async function getAccessToken() {
     .single();
 
   if (error || !data?.access_token) {
-    throw new Error("❌ Shopify token introuvable");
+    throw new Error("❌ No Shopify token");
   }
 
   return data.access_token;
 }
 
 /**
- * ⏱️ Sleep (anti rate limit)
+ * ⏱️ Sleep
  */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -118,11 +119,11 @@ function mapStatus(status) {
 }
 
 /**
- * 🔍 Récupère variant ID depuis Shopify
+ * 🔍 Fetch variant ID
  */
 async function fetchVariantId(productId, headers) {
   const res = await axios.get(
-    `https://${SHOP}/admin/api/2025-01/products/${productId}.json`,
+    `https://${SHOP}/admin/api/2026-04/products/${productId}.json`,
     { headers }
   );
 
@@ -130,11 +131,11 @@ async function fetchVariantId(productId, headers) {
 }
 
 /**
- * ➕ CREATE PRODUCT
+ * ➕ CREATE
  */
 async function createProduct(p, headers) {
   const res = await axios.post(
-    `https://${SHOP}/admin/api/2025-01/products.json`,
+    `https://${SHOP}/admin/api/2026-04/products.json`,
     {
       product: {
         title: p.title,
@@ -150,16 +151,14 @@ async function createProduct(p, headers) {
     { headers }
   );
 
-  const product = res.data.product;
-
   return {
-    id: product.id,
-    variantId: product.variants?.[0]?.id
+    id: res.data.product.id,
+    variantId: res.data.product.variants?.[0]?.id
   };
 }
 
 /**
- * 🔄 UPDATE PRODUCT + PRICE
+ * 🔄 UPDATE
  */
 async function updateProduct(p, headers) {
   const productId = p.shopify_product_id;
@@ -169,14 +168,14 @@ async function updateProduct(p, headers) {
 
   // 🔥 récupérer variant si absent
   if (!variantId) {
-    console.log("🔍 Fetching variant ID...");
+    console.log("🔍 Fetch variant...");
     variantId = await fetchVariantId(productId, headers);
-    console.log("✅ Variant found:", variantId);
+    console.log("✅ Variant:", variantId);
   }
 
   // update product
   await axios.put(
-    `https://${SHOP}/admin/api/2025-01/products/${productId}.json`,
+    `https://${SHOP}/admin/api/2026-04/products/${productId}.json`,
     {
       product: {
         id: productId,
@@ -189,22 +188,18 @@ async function updateProduct(p, headers) {
   );
 
   // update price
-  if (variantId) {
-    await axios.put(
-      `https://${SHOP}/admin/api/2025-01/variants/${variantId}.json`,
-      {
-        variant: {
-          id: variantId,
-          price: String(p.price)
-        }
-      },
-      { headers }
-    );
+  await axios.put(
+    `https://${SHOP}/admin/api/2026-04/variants/${variantId}.json`,
+    {
+      variant: {
+        id: variantId,
+        price: String(p.price)
+      }
+    },
+    { headers }
+  );
 
-    console.log("💰 Price updated:", p.price);
-  } else {
-    throw new Error("Variant introuvable");
-  }
+  console.log("💰 Price updated:", p.price);
 
   return variantId;
 }
@@ -227,7 +222,7 @@ async function countRemaining() {
 export default async function handler(req, res) {
   try {
     console.log("🛒 START SHOPIFY SYNC");
-    console.log("SHOP:", SHOP);
+    console.log("🏪 SHOP:", SHOP);
 
     const TOKEN = await getAccessToken();
 
@@ -237,95 +232,88 @@ export default async function handler(req, res) {
     };
 
     /**
-     * 1. FETCH
+     * 1. FETCH (juste 1 pour debug)
      */
     const { data: products, error } = await supabase
       .from("products")
       .select("*")
       .eq("needs_shopify_update", true)
-      .order("created_at", { ascending: true })
-      .limit(50);
+      .limit(1);
 
     if (error) throw error;
 
     if (!products || products.length === 0) {
       return res.status(200).json({
         ok: true,
-        message: "Nothing to sync",
-        remaining: 0
+        message: "Nothing to sync"
       });
     }
 
-    let processed = 0;
+    const p = products[0];
 
     /**
-     * 2. LOOP
+     * 🔥 TEST SHOPIFY (ULTRA IMPORTANT)
      */
-    for (const p of products) {
-      try {
-        console.log("🔄 Product:", p.item_code);
+    console.log("🧪 TEST PRODUCT ID:", p.shopify_product_id);
 
-        if (!p.price || isNaN(p.price)) {
-          console.warn("⚠️ Invalid price → skip");
-          continue;
-        }
+    try {
+      const test = await axios.get(
+        `https://${SHOP}/admin/api/2026-04/products/${p.shopify_product_id}.json`,
+        { headers: HEADERS }
+      );
 
-        let shopifyId = p.shopify_product_id;
-        let variantId = p.variant_id;
+      console.log("✅ TEST SUCCESS → Product accessible");
 
-        // CREATE
-        if (!shopifyId) {
-          console.log("➕ Creating product");
+    } catch (err) {
+      console.error("❌ TEST FAILED");
 
-          const created = await createProduct(p, HEADERS);
-
-          shopifyId = created.id;
-          variantId = created.variantId;
-
-        } else {
-          console.log("✏️ Updating product");
-
-          variantId = await updateProduct(p, HEADERS);
-        }
-
-        /**
-         * UPDATE SUPABASE
-         */
-        await supabase
-          .from("products")
-          .update({
-            shopify_product_id: shopifyId,
-            variant_id: variantId,
-            needs_shopify_update: false,
-            last_shopify_sync: new Date().toISOString()
-          })
-          .eq("id", p.id);
-
-        processed++;
-
-        await sleep(500);
-
-      } catch (err) {
-        console.error("❌ ERROR PRODUCT:", p.item_code);
-
-        if (err.response) {
-          console.error(err.response.data);
-        } else {
-          console.error(err.message);
-        }
-
-        continue;
+      if (err.response) {
+        console.error("🔥 SHOPIFY:", err.response.data);
+      } else {
+        console.error(err.message);
       }
+
+      return res.status(500).json({
+        error: "Shopify test failed"
+      });
     }
 
-    const remaining = await countRemaining();
+    /**
+     * 🔄 SYNC NORMAL (1 produit pour test)
+     */
+    let shopifyId = p.shopify_product_id;
+    let variantId = p.variant_id;
 
-    console.log(`✅ DONE: ${processed} | Remaining: ${remaining}`);
+    if (!shopifyId) {
+      console.log("➕ CREATE");
+
+      const created = await createProduct(p, HEADERS);
+      shopifyId = created.id;
+      variantId = created.variantId;
+
+    } else {
+      console.log("✏️ UPDATE");
+
+      variantId = await updateProduct(p, HEADERS);
+    }
+
+    /**
+     * UPDATE DB
+     */
+    await supabase
+      .from("products")
+      .update({
+        shopify_product_id: shopifyId,
+        variant_id: variantId,
+        needs_shopify_update: false,
+        last_shopify_sync: new Date().toISOString()
+      })
+      .eq("id", p.id);
+
+    console.log("✅ DONE");
 
     return res.status(200).json({
-      ok: true,
-      processed,
-      remaining
+      ok: true
     });
 
   } catch (err) {
