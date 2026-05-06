@@ -10,6 +10,80 @@ export default async function handler(req, res) {
     const { data: auth } = await supabase.from("shopify_auth").select("access_token").single();
     const HEADERS = { "X-Shopify-Access-Token": auth.access_token, "Content-Type": "application/json" };
 
+    const { data: products, error: dbError } = await supabase
+      .from("products")
+      .select("id, item_code, price")
+      .eq("needs_shopify_update", true) 
+      .limit(2);
+
+    if (dbError) throw dbError;
+    if (!products || products.length === 0) return res.status(200).json({ message: "Rien à synchroniser" });
+
+    for (const p of products) {
+      try {
+        // 1. On cherche la variante fraichement pour CHAQUE produit
+        const checkSku = await axios.get(
+          `https://${SHOP}/admin/api/${API_VERSION}/variants.json?sku=${encodeURIComponent(p.item_code)}`, 
+          { headers: HEADERS }
+        );
+
+        if (checkSku.data.variants && checkSku.data.variants.length > 0) {
+          const variant = checkSku.data.variants[0];
+          const vId = variant.id;
+          
+          // ON DÉFINIT BIEN LES VALEURS ICI POUR CETTE ITÉRATION UNIQUEMENT
+          const currentShopifyPrice = String(variant.price);
+          const targetSupabasePrice = String(p.price);
+
+          console.log(`--- [SKU: ${p.item_code}] ---`);
+          console.log(`Ancien prix Shopify : ${currentShopifyPrice}€`);
+          console.log(`Prix Supabase       : ${targetSupabasePrice}€`);
+
+          if (currentShopifyPrice !== targetSupabasePrice) {
+            await axios.put(`https://${SHOP}/admin/api/${API_VERSION}/variants/${vId}.json`, {
+              variant: { id: vId, price: targetSupabasePrice }
+            }, { headers: HEADERS });
+            console.log(`Résultat            : ✅ Prix mis à jour`);
+          } else {
+            console.log(`Résultat            : ✨ Déjà à jour`);
+          }
+
+          // Mise à jour Supabase
+          await supabase.from("products").update({ 
+            needs_shopify_update: false,
+            last_shopify_sync: new Date().toISOString()
+          }).eq("id", p.id);
+
+        } else {
+          console.log(`⚠️ [${p.item_code}] Introuvable sur Shopify`);
+          await supabase.from("products").update({ needs_shopify_update: false }).eq("id", p.id);
+        }
+
+      } catch (err) {
+        console.error(`❌ Erreur sur ${p.item_code}:`, err.message);
+      }
+    }
+
+    return res.status(200).json({ status: "done" });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+/*
+
+import axios from "axios";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const SHOP = process.env.SHOPIFY_SHOP;
+const API_VERSION = "2024-01";
+
+export default async function handler(req, res) {
+  try {
+    const { data: auth } = await supabase.from("shopify_auth").select("access_token").single();
+    const HEADERS = { "X-Shopify-Access-Token": auth.access_token, "Content-Type": "application/json" };
+
     // On utilise ta colonne 'needs_shopify_update'
     const { data: products, error: dbError } = await supabase
       .from("products")
@@ -75,3 +149,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: err.message });
   }
 }
+*/
