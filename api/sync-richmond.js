@@ -65,490 +65,176 @@
  */
 
 
-/* New */
-
 import axios from "axios";
-
 import { createClient } from "@supabase/supabase-js";
-
 import crypto from "crypto";
 
-
-
-/**
-
- * 🔌 Supabase
-
- */
-
 const supabase = createClient(
-
   process.env.SUPABASE_URL,
-
   process.env.SUPABASE_KEY
-
 );
 
-
-
-/**
-
- * 🌐 Richmond API
-
- */
-
 const BASE = "https://www.richmondinteriors.nl/api/v1/products";
-
 const AUTH = process.env.RICHMOND_AUTH;
 
-
-
 const API = {
-
   details: `${BASE}/details/${AUTH}`,
-
   pricing: `${BASE}/pricing/${AUTH}`,
-
   stock: `${BASE}/stocklevels/${AUTH}`,
-
   desc: `${BASE}/descriptions/${AUTH}`
-
 };
-
-
-
-/**
-
- * 💰 Pricing
-
- */
 
 const COEFF = parseFloat(process.env.PRICE_COEFF || "2.3");
 
-
-
-/**
-
- * 🔐 Hash
-
- */
-
 function generateHash(data) {
-
-  return crypto
-
-    .createHash("md5")
-
-    .update(JSON.stringify(data))
-
-    .digest("hex");
-
+  return crypto.createHash("md5").update(JSON.stringify(data)).digest("hex");
 }
 
-
-
-/**
-
- * 💰 Price parser
-
- */
-
-function parsePrice(value) {
-
-  if (!value) return 0;
-
-  return parseFloat(value.replace(",", "."));
-
+function parsePrice(v) {
+  return v ? parseFloat(v.replace(",", ".")) : 0;
 }
 
-
-
-/**
-
- * 📦 Stock parser SAFE
-
- */
-
-function parseStock(value) {
-
-  if (!value) return 0;
-
-
-
-  const num = parseInt(String(value).replace(/[^\d]/g, ""));
-
-  return isNaN(num) ? 0 : num;
-
+function parseStock(v) {
+  const n = parseInt(String(v || "").replace(/[^\d]/g, ""));
+  return isNaN(n) ? 0 : n;
 }
-
-
-
-/**
-
- * 🖼️ Images builder
-
- */
 
 function buildImages(p) {
-
   const base = p["Product Images Location"] || "";
-
-
-
   return (p["Product Images"] || "")
-
     .split(",")
-
     .map(i => i.trim())
-
-    .filter(i => i && i.length > 0)
-
+    .filter(Boolean)
     .map(i => base + i)
-
     .sort();
-
 }
-
-
-
-/**
-
- * 🧠 Status mapping
-
- */
 
 function mapStatus(p) {
-
   const raw = (p["Product Status"] || "").toLowerCase();
-
-
-
-  if (raw.includes("discontinued")) return "archived";
-
-  return "active";
-
+  return raw.includes("discontinued") ? "archived" : "active";
 }
 
-
-
-/**
-
- * 🚀 Handler
-
- */
-
 export default async function handler(req, res) {
-
   try {
-
     console.log("🔄 Richmond sync...");
 
-
-
-    /**
-
-     * 1. FETCH API
-
-     */
-
     const [productsRes, pricingRes, stockRes, descRes] =
-
       await Promise.all([
-
         axios.get(API.details),
-
         axios.get(API.pricing),
-
         axios.get(API.stock),
-
         axios.get(API.desc)
-
       ]);
 
-
-
-    /**
-
-     * 2. MAPS
-
-     */
+    const allProducts = productsRes.data;
 
     const pricingMap = Object.fromEntries(
-
       pricingRes.data.map(p => [p.itemCodeNew, p])
-
     );
-
-
 
     const stockMap = Object.fromEntries(
-
       stockRes.data.map(s => [s.itemCodeNew, s])
-
     );
-
-
 
     const descMap = Object.fromEntries(
-
       descRes.data.map(d => [d.itemCodeNew, d])
-
     );
 
-
-
-    /**
-
-     * 3. PAGINATION
-
-     */
-
-    /*const offset = parseInt(req.query.offset || "0");
-
     const limit = 100;
-
-
-
-    const allProducts = productsRes.data;
-
-    const batch = allProducts.slice(offset, offset + limit);*/
-
-    const limit = 100;
-
-    const allProducts = productsRes.data;
-
-    
-
-    let processed = 0;
-
-    
+    let totalProcessed = 0;
 
     for (let offset = 0; offset < allProducts.length; offset += limit) {
-
       const batch = allProducts.slice(offset, offset + limit);
+      const codes = batch.map(p => p.itemCodeNew);
 
-    
-
-      // TON CODE EXISTANT (loop produits)
-
-      // push dans upserts
-
-    
-
-      processed += batch.length;
-
-    }
-
-    const codes = batch.map(p => p.itemCodeNew);
-
-
-
-    /**
-
-     * 4. FETCH EXISTING (BULK)
-
-     */
-
-    const { data: existingRows } = await supabase
-
-      .from("products")
-
-      .select("item_code, richmond_hash")
-
-      .in("item_code", codes);
-
-
-
-    const existingMap = Object.fromEntries(
-
-      (existingRows || []).map(e => [e.item_code, e])
-
-    );
-
-
-
-    const upserts = [];
-
-
-
-    /**
-
-     * 5. BUILD PRODUCTS
-
-     */
-
-    for (const p of batch) {
-
-      const code = p.itemCodeNew;
-
-
-
-      const priceData = pricingMap[code];
-
-      const stockData = stockMap[code];
-
-      const desc = descMap[code];
-
-
-
-      const basePrice = parsePrice(priceData?.retailPrice);
-
-      const finalPrice = Number((basePrice * COEFF).toFixed(2));
-
-
-
-      const productData = {
-
-        title: p.description2 || p.description3 || "",
-
-        price: finalPrice,
-
-        richmond_price: basePrice,
-
-        stock: parseStock(stockData?.onlineAvailabilityText),
-
-        description: (desc?.longDescriptionFR || "").trim(),
-
-        images: buildImages(p),
-
-        status: mapStatus(p)
-
-      };
-
-
-
-      const hash = generateHash(productData);
-
-      const existing = existingMap[code];
-
-
-
-      const hasChanged = !existing || existing.richmond_hash !== hash;
-
-
-
-      upserts.push({
-
-        item_code: code,
-
-        title: productData.title,
-
-        price: productData.price,
-
-        richmond_price: productData.richmond_price,
-
-        stock_quantity: productData.stock,
-
-        description_fr: productData.description,
-
-        images: productData.images,
-
-        status: productData.status,
-
-        richmond_hash: hash,
-
-        needs_shopify_update: hasChanged,
-
-        last_richmond_sync: new Date().toISOString()
-
-      });
-
-    }
-
-
-
-    /**
-
-     * 6. BULK UPSERT
-
-     */
-
-    if (upserts.length > 0) {
-
-      await supabase.from("products").upsert(upserts, {
-
-        onConflict: "item_code"
-
-      });
-
-    }
-
-
-
-    /**
-
-     * 7. HANDLE DELETED PRODUCTS (ONLY FIRST PAGE)
-
-     */
-
-    if (offset === 0) {
-
-      const allCodes = allProducts.map(p => p.itemCodeNew);
-
-
-
-      const { data: dbProducts } = await supabase
-
+      const { data: existingRows } = await supabase
         .from("products")
+        .select("item_code, richmond_hash")
+        .in("item_code", codes);
 
-        .select("item_code");
-
-
-
-      const deleted = (dbProducts || []).filter(
-
-        p => !allCodes.includes(p.item_code)
-
+      const existingMap = Object.fromEntries(
+        (existingRows || []).map(e => [e.item_code, e])
       );
 
+      const upserts = [];
 
+      for (const p of batch) {
+        const code = p.itemCodeNew;
 
-      for (const p of deleted) {
+        const basePrice = parsePrice(pricingMap[code]?.retailPrice);
+        const finalPrice = Number((basePrice * COEFF).toFixed(2));
 
-        await supabase
+        const productData = {
+          title: p.description2 || p.description3 || "",
+          price: finalPrice,
+          richmond_price: basePrice,
+          stock: parseStock(stockMap[code]?.onlineAvailabilityText),
+          description: (descMap[code]?.longDescriptionFR || "").trim(),
+          images: buildImages(p),
+          status: mapStatus(p)
+        };
 
-          .from("products")
+        const hash = generateHash(productData);
+        const existing = existingMap[code];
 
-          .update({
+        const hasChanged = !existing || existing.richmond_hash !== hash;
 
-            status: "archived",
-
-            needs_shopify_update: true
-
-          })
-
-          .eq("item_code", p.item_code);
-
+        upserts.push({
+          item_code: code,
+          title: productData.title,
+          price: productData.price,
+          richmond_price: productData.richmond_price,
+          stock_quantity: productData.stock,
+          description_fr: productData.description,
+          images: productData.images,
+          status: productData.status,
+          richmond_hash: hash,
+          needs_shopify_update: hasChanged,
+          last_richmond_sync: new Date().toISOString()
+        });
       }
 
+      if (upserts.length > 0) {
+        await supabase.from("products").upsert(upserts, {
+          onConflict: "item_code"
+        });
+      }
 
-
-      console.log(`🗑️ Archived ${deleted.length} deleted products`);
-
+      totalProcessed += upserts.length;
+      console.log(`Batch processed: ${upserts.length}`);
     }
 
+    // 🔥 Gestion produits supprimés
+    const allCodes = allProducts.map(p => p.itemCodeNew);
 
+    const { data: dbProducts } = await supabase
+      .from("products")
+      .select("item_code");
 
-    console.log(`✅ Sync done (${upserts.length} produits)`);
+    const deleted = (dbProducts || []).filter(
+      p => !allCodes.includes(p.item_code)
+    );
 
+    for (const p of deleted) {
+      await supabase
+        .from("products")
+        .update({
+          status: "archived",
+          needs_shopify_update: true
+        })
+        .eq("item_code", p.item_code);
+    }
 
+    console.log(`🗑️ Archived ${deleted.length}`);
+    console.log(`✅ Total processed: ${totalProcessed}`);
 
     return res.status(200).json({
-
       ok: true,
-
-      processed: upserts.length
-
+      processed: totalProcessed
     });
 
-
-
   } catch (err) {
-
     console.error("❌ Error:", err.message);
-
     return res.status(500).json({ error: err.message });
-
   }
-
 }
