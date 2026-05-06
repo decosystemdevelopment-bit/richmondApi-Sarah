@@ -91,7 +91,12 @@ function generateHash(data) {
 }
 
 function parsePrice(v) {
-  return v ? parseFloat(v.replace(",", ".")) : 0;
+  if (!v) return 0;
+  return parseFloat(
+    v
+      .replace(/\./g, "")   // enlève milliers
+      .replace(",", ".")    // virgule → point
+  );
 }
 
 function parseStock(v) {
