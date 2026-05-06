@@ -161,7 +161,7 @@ export default async function handler(req, res) {
       for (const p of batch) {
         const code = p.itemCodeNew;
 
-        const basePrice = parsePrice(pricingMap[code]?.retailPrice);
+        const basePrice = parsePrice(pricingMap[code]?.price);//prix fournisseur
         const finalPrice = Number((basePrice * COEFF).toFixed(2));
 
         const productData = {
