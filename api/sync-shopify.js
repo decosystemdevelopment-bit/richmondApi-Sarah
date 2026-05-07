@@ -303,6 +303,7 @@ async function fetchProductsToSync({ id, itemCode, limit, linkOnly, syncImages }
     .from(PRODUCT_TABLE)
     .select("*")
     .or(pendingFlags.join(","))
+    .is("last_sync_error", null)
     .order("updated_at", { ascending: true, nullsFirst: false })
     .limit(limit);
 
