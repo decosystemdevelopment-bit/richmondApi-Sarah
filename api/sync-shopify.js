@@ -598,12 +598,51 @@ async function fetchProduct(productId, headers) {
 }
 
 async function searchVariantsBySku(sku, headers) {
-  const response = await shopify.get(
-    `/variants.json?sku=${encodeURIComponent(sku)}`,
+  const query = `
+    query FindVariantBySku($query: String!) {
+      productVariants(first: 10, query: $query) {
+        nodes {
+          id
+          legacyResourceId
+          sku
+          product {
+            id
+            legacyResourceId
+          }
+          inventoryItem {
+            id
+            legacyResourceId
+          }
+        }
+      }
+    }
+  `;
+
+  const response = await shopify.post(
+    "/graphql.json",
+    {
+      query,
+      variables: {
+        query: buildSkuSearchQuery(sku)
+      }
+    },
     { headers }
   );
 
-  return response.data.variants || [];
+  if (response.data.errors?.length) {
+    throw new Error(JSON.stringify(response.data.errors));
+  }
+
+  return (response.data.data?.productVariants?.nodes || []).map((variant) => ({
+    id: String(variant.legacyResourceId || legacyIdFromGid(variant.id)),
+    sku: variant.sku,
+    product_id: String(
+      variant.product?.legacyResourceId || legacyIdFromGid(variant.product?.id)
+    ),
+    inventory_item_id: String(
+      variant.inventoryItem?.legacyResourceId || legacyIdFromGid(variant.inventoryItem?.id)
+    )
+  }));
 }
 
 async function saveShopifyIds(productId, match) {
@@ -706,6 +745,21 @@ function toLegacyId(value) {
   return match ? match[1] : text;
 }
 
+function legacyIdFromGid(value) {
+  const text = cleanString(value);
+  const match = text.match(/(\d+)$/);
+  return match ? match[1] : "";
+}
+
+function buildSkuSearchQuery(sku) {
+  const value = cleanString(sku);
+  if (/^[A-Za-z0-9_-]+$/.test(value)) {
+    return `sku:${value}`;
+  }
+
+  return `sku:${JSON.stringify(value)}`;
+}
+
 function normalizeShop(value) {
   const text = cleanString(value)
     .replace(/^https?:\/\//, "")
@@ -750,8 +804,6 @@ function requireAnyEnv(names) {
 
   throw new Error(`Missing required environment variable: ${names.join(" or ")}`);
 }
-
-
 
 
 
