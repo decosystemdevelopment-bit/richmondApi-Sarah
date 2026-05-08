@@ -211,9 +211,13 @@ async function syncOneProduct({
 
     if (product.needs_images_update) {
       if (syncImages) {
-        await appendMissingImages(product, match.productId, headers);
+        const imageResult = await appendMissingImages(product, match.productId, headers);
         clearedFlags.needs_images_update = false;
         result.synced.push("images");
+
+        if (imageResult.skippedInvalid > 0) {
+          result.skipped.push(`invalid_images:${imageResult.skippedInvalid}`);
+        }
       } else {
         result.skipped.push("images");
       }
@@ -454,8 +458,17 @@ async function setInventoryLevel(product, inventoryItemId, locationId, headers) 
 }
 
 async function appendMissingImages(product, productId, headers) {
-  const desiredUrls = Array.isArray(product.images) ? product.images.filter(Boolean) : [];
-  if (desiredUrls.length === 0) return;
+  const desiredUrls = Array.isArray(product.images)
+    ? product.images.map(normalizeImageUrl).filter(Boolean)
+    : [];
+
+  const summary = {
+    added: 0,
+    alreadyExists: 0,
+    skippedInvalid: 0
+  };
+
+  if (desiredUrls.length === 0) return summary;
 
   const response = await shopify.get(`/products/${productId}/images.json`, { headers });
   const existingImages = response.data.images || [];
@@ -467,21 +480,36 @@ async function appendMissingImages(product, productId, headers) {
 
   for (const url of desiredUrls) {
     const filename = filenameFromUrl(url);
-    if (filename && existingFilenames.has(filename)) continue;
+    if (filename && existingFilenames.has(filename)) {
+      summary.alreadyExists += 1;
+      continue;
+    }
 
-    await shopify.post(
-      `/products/${productId}/images.json`,
-      {
-        image: {
-          src: url,
-          alt: `Richmond ${product.item_code || ""} ${filename || ""}`.trim()
-        }
-      },
-      { headers }
-    );
+    try {
+      await shopify.post(
+        `/products/${productId}/images.json`,
+        {
+          image: {
+            src: url,
+            alt: `Richmond ${product.item_code || ""} ${filename || ""}`.trim()
+          }
+        },
+        { headers }
+      );
+    } catch (error) {
+      if (isInvalidImageUrlError(error)) {
+        summary.skippedInvalid += 1;
+        continue;
+      }
+
+      throw error;
+    }
 
     if (filename) existingFilenames.add(filename);
+    summary.added += 1;
   }
+
+  return summary;
 }
 
 async function upsertProductMetafields(product, productId, headers) {
@@ -718,6 +746,23 @@ function splitMaterials(value) {
   return text.split(/[|,/]/).map(cleanString).filter(Boolean);
 }
 
+function normalizeImageUrl(value) {
+  const text = cleanString(value);
+  if (!text) return "";
+
+  try {
+    const url = new URL(text);
+    url.pathname = url.pathname
+      .split("/")
+      .map((segment) => encodeURIComponent(decodeURIComponent(segment)))
+      .join("/");
+
+    return url.toString();
+  } catch {
+    return text;
+  }
+}
+
 function filenameFromUrl(url) {
   const text = cleanString(url);
   if (!text) return "";
@@ -786,6 +831,11 @@ function readBooleanQuery(value, fallback) {
   const raw = Array.isArray(value) ? value[0] : value;
   if (raw === undefined) return fallback;
   return ["1", "true", "yes", "on"].includes(String(raw).toLowerCase());
+}
+
+function isInvalidImageUrlError(error) {
+  const text = formatShopifyError(error).toLowerCase();
+  return text.includes("image") && text.includes("invalid");
 }
 
 function formatShopifyError(error) {
