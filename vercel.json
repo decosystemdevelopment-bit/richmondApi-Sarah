@@ -6,22 +6,6 @@
     },
     "api/sync-shopify.js": {
       "maxDuration": 60
-    },
-    "api/cron-richmond-daily.js": {
-      "maxDuration": 60
-    },
-    "api/cron-shopify-daily.js": {
-      "maxDuration": 60
     }
-  },
-  "crons": [
-    {
-      "path": "/api/cron-richmond-daily",
-      "schedule": "0 20 * * *"
-    },
-    {
-      "path": "/api/cron-shopify-daily",
-      "schedule": "0 22 * * *"
-    }
-  ]
+  }
 }
