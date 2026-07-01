@@ -220,7 +220,11 @@ function normalizeProduct(details, pricing, stock, descriptions) {
     item_code_new: itemCodeNew,
     ean: cleanString(details.eanCode),
     title: cleanString(details.description2 || details.description3 || details.description || itemCodeNew),
-    product_type: cleanString(details["Product type"]),
+    product_type: cleanString(
+      details["Product type FR"] ||
+        details["Product type UK"] ||
+        details["Product type"]
+    ),
     description_fr: descriptionFr,
     description_en: descriptionEn,
     images,
@@ -641,5 +645,4 @@ function requireAnyEnv(names) {
 
   throw new Error(`Missing required environment variable: ${names.join(" or ")}`);
 }
-
 
