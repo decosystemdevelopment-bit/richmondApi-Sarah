@@ -4,5 +4,14 @@
     "api/cron-richmond.js": { "maxDuration": 300 },
     "api/sync-richmond.js": { "maxDuration": 300 },
     "api/sync-shopify.js": { "maxDuration": 300 }
-  }
+  },
+  "crons": [
+    { "path": "/api/cron-richmond?job=catalogue", "schedule": "6 0,12 * * *" },
+    { "path": "/api/cron-richmond?job=supplier-stock", "schedule": "6 6,18 * * *" },
+    { "path": "/api/cron-richmond?job=stock", "schedule": "*/5 * * * *" },
+    { "path": "/api/cron-richmond?job=prices", "schedule": "1-59/10 * * * *" },
+    { "path": "/api/cron-richmond?job=information", "schedule": "2-59/10 * * * *" },
+    { "path": "/api/cron-richmond?job=images", "schedule": "3-59/10 * * * *" },
+    { "path": "/api/cron-richmond?job=publish", "schedule": "4-59/10 * * * *" }
+  ]
 }
