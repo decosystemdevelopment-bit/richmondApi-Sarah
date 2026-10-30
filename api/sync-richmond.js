@@ -37,6 +37,12 @@ const http = axios.create({
 });
 
 export default async function handler(req, res) {
+  res.setHeader("Cache-Control", "no-store");
+  const expectedSecret = process.env.AUDIT_SECRET;
+  if (!expectedSecret || req.headers.authorization !== `Bearer ${expectedSecret}`) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
   if (!["GET", "POST"].includes(req.method)) {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
@@ -48,7 +54,7 @@ export default async function handler(req, res) {
     const offset = readIntQuery(req.query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
     const limit = readIntQuery(req.query.limit, DEFAULT_LIMIT, 1, 500);
     const runFullSync = readBooleanQuery(req.query.full, false);
-    const archiveMissing = readBooleanQuery(req.query.archiveMissing, offset === 0);
+    const archiveMissing = false; // Missing reference alone is never an archival instruction.
 
     const [detailsRes, pricingRes, stockRes, descriptionsRes] = await Promise.all([
       http.get(richmondApi.details),
@@ -61,6 +67,14 @@ export default async function handler(req, res) {
     const pricingMap = buildRichmondMap(asArray(pricingRes.data, "pricing"));
     const stockMap = buildRichmondMap(asArray(stockRes.data, "stocklevels"));
     const descriptionsMap = buildRichmondMap(asArray(descriptionsRes.data, "descriptions"));
+
+    const referenceSets = [detailsRows, asArray(pricingRes.data, "pricing"), asArray(stockRes.data, "stocklevels"), asArray(descriptionsRes.data, "descriptions")];
+    const expectedCodes = new Set(detailsRows.map(getPrimaryCode));
+    if (!detailsRows.length || expectedCodes.size !== detailsRows.length ||
+        referenceSets.some(rows => new Set(rows.map(getPrimaryCode)).size !== rows.length ||
+          rows.length !== expectedCodes.size || rows.some(row => !expectedCodes.has(getPrimaryCode(row))))) {
+      throw new Error("Supplier datasets are incomplete or inconsistent; no product writes performed");
+    }
 
     const rowsToProcess = runFullSync
       ? detailsRows
@@ -159,11 +173,12 @@ export default async function handler(req, res) {
     }
 
     if (upserts.length > 0) {
-      const { error } = await supabase.from(PRODUCT_TABLE).upsert(upserts, {
-        onConflict: "item_code"
-      });
-
-      if (error) throw error;
+      for (const chunk of chunkArray(upserts, 100)) {
+        const { error } = await supabase.from(PRODUCT_TABLE).upsert(chunk, {
+          onConflict: "item_code", defaultToNull: false
+        });
+        if (error) throw error;
+      }
     }
 
     const archived = archiveMissing
@@ -188,10 +203,10 @@ export default async function handler(req, res) {
       durationMs: Date.now() - startedAt
     });
   } catch (error) {
-    console.error("Richmond sync failed:", error);
+    console.error("Richmond sync failed; no upstream URL logged.");
     return res.status(500).json({
       ok: false,
-      error: error.message
+      error: "Richmond sync failed; check supplier access and database schema"
     });
   }
 }
@@ -221,7 +236,7 @@ function normalizeProduct(details, pricing, stock, descriptions) {
     ean: cleanString(details.eanCode),
     title: cleanString(details.description2 || details.description3 || details.description || itemCodeNew),
     product_type: cleanString(
-      details["Product type FR"] ||
+      details.productTypeFr || details["Product type FR"] ||
         details["Product type UK"] ||
         details["Product type"]
     ),
@@ -233,7 +248,7 @@ function normalizeProduct(details, pricing, stock, descriptions) {
     height: parseRichmondNumber(details["Height (cm)"]),
     depth: parseRichmondNumber(details["Depth (cm)"]),
     weight: parseRichmondNumber(details["Bruto Weight"]),
-    materials: cleanString(details.Materiaal),
+    materials: cleanString(details.materialsFr || details.Materiaal),
     color: joinParts([details.Exterior, details.Interior, details.Finishing]),
     volume: parseRichmondNumber(details.Volume),
     extra_info: cleanText(details["Extra Informatie"]),
@@ -357,32 +372,13 @@ function buildHashes(product) {
 }
 
 async function fetchExistingProducts(codes) {
-  if (codes.length === 0) return [];
-
-  const { data, error } = await supabase
-    .from(PRODUCT_TABLE)
-    .select(`
-      item_code,
-      item_code_new,
-      shopify_product_id,
-      status,
-      images,
-      richmond_hash,
-      richmond_details_hash,
-      richmond_pricing_hash,
-      richmond_stock_hash,
-      richmond_descriptions_hash,
-      needs_stock_update,
-      needs_price_update,
-      needs_compare_at_price_update,
-      needs_status_update,
-      needs_description_update,
-      needs_images_update
-    `)
-    .in("item_code", codes);
-
-  if (error) throw error;
-  return data || [];
+  const all = [];
+  for (const chunk of chunkArray(codes, 100)) {
+    const { data, error } = await supabase.from(PRODUCT_TABLE).select("*").in("item_code", chunk);
+    if (error) throw error;
+    all.push(...(data || []));
+  }
+  return all;
 }
 
 async function archiveMissingProducts(currentCodes, now) {
@@ -557,10 +553,10 @@ function parseInteger(value) {
 
 function parseStockQuantity(value) {
   const text = cleanString(value);
-  if (!text || text === "-") return 0;
+  if (!text || text === "-") return null;
 
   const number = parseInteger(text);
-  if (number === null) return 0;
+  if (number === null) return null;
 
   if (text.startsWith("<")) {
     return Math.max(number - 1, 0);
