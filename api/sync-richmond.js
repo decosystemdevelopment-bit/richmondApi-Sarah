@@ -49,6 +49,9 @@ export default async function handler(req, res) {
   }
 
   try {
+    if (process.env.RICHMOND_CRON_ENABLED === "true" && req.richmondInternalCron !== true) {
+      return res.status(409).json({ ok: false, error: "Scheduled pipeline enabled; use its locked entry point" });
+    }
     if (readBooleanQuery(req.query.stockOnly, false)) {
       return res.status(200).json(await refreshStockOnly());
     }
@@ -74,7 +77,7 @@ export default async function handler(req, res) {
 
     const referenceSets = [detailsRows, asArray(pricingRes.data, "pricing"), asArray(stockRes.data, "stocklevels"), asArray(descriptionsRes.data, "descriptions")];
     const expectedCodes = new Set(detailsRows.map(getPrimaryCode));
-    if (!detailsRows.length || expectedCodes.size !== detailsRows.length ||
+    if (detailsRows.length < Number(process.env.RICHMOND_MIN_PRODUCTS || 1000) || expectedCodes.size !== detailsRows.length ||
         referenceSets.some(rows => new Set(rows.map(getPrimaryCode)).size !== rows.length ||
           rows.length !== expectedCodes.size || rows.some(row => !expectedCodes.has(getPrimaryCode(row))))) {
       throw new Error("Supplier datasets are incomplete or inconsistent; no product writes performed");
@@ -200,6 +203,7 @@ export default async function handler(req, res) {
       created,
       changed,
       archived,
+      item_codes: codes,
       offset: runFullSync ? 0 : offset,
       limit: runFullSync ? detailsRows.length : limit,
       nextOffset,
@@ -219,7 +223,7 @@ async function refreshStockOnly() {
   const response = await http.get(richmondApi.stock);
   const rows = asArray(response.data, "stocklevels");
   const codes = rows.map(getPrimaryCode);
-  if (!rows.length || codes.some(code => !code) || new Set(codes).size !== codes.length) {
+  if (rows.length < Number(process.env.RICHMOND_MIN_PRODUCTS || 1000) || codes.some(code => !code) || new Set(codes).size !== codes.length) {
     throw new Error("Invalid stock snapshot");
   }
   const existing = await fetchExistingProducts(codes);
