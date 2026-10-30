@@ -1,6 +1,7 @@
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 
 const requestCache = new AsyncLocalStorage();
 
@@ -27,8 +28,9 @@ export default function handler(req, res) {
 
 async function handleRequest(req, res) {
   res.setHeader("Cache-Control", "no-store");
-  const expectedSecret = process.env.AUDIT_SECRET;
-  if (!expectedSecret || req.headers.authorization !== `Bearer ${expectedSecret}`) {
+  const authorised = [process.env.AUDIT_SECRET, process.env.CRON_SECRET].filter(Boolean)
+    .some(secret => req.headers.authorization === `Bearer ${secret}`);
+  if (!authorised) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
 
@@ -37,6 +39,9 @@ async function handleRequest(req, res) {
   }
 
   try {
+    if (readBooleanQuery(req.query.stockBatch, false)) {
+      return await syncStockBatch(req, res);
+    }
     if (readBooleanQuery(req.query.plan, false)) {
       const rows = [];
       for (let offset = 0; ; offset += 500) {
@@ -47,7 +52,7 @@ async function handleRequest(req, res) {
         rows.push(...data);
         if (data.length < 500) break;
       }
-      return res.status(200).json({ ok: true, products: rows });
+      return res.status(200).json({ ok: true, products: rows, configured_location_id: process.env.SHOPIFY_LOCATION_ID || null });
     }
     const startedAt = Date.now();
     const now = new Date().toISOString();
@@ -271,12 +276,8 @@ async function syncOneProduct({
     }
 
     if (priority && product.needs_stock_update && locationId) {
-      const inventoryItemId =
-        match.inventoryItemId || (await fetchInventoryItemId(match.variantId, headers));
-
-      await setInventoryLevel(product, inventoryItemId, locationId, headers);
-      clearedFlags.needs_stock_update = false;
-      result.synced.push("stock");
+      // All stock writes now use the bulk path, which checks manual overrides and CAS.
+      result.skipped.push("stock_handled_by_batch");
     }
 
     if (priority && product.needs_stock_update && !locationId) {
@@ -764,6 +765,122 @@ function metafieldValuesEqual(a, b) {
   return String(a.value) === String(b.value);
 }
 
+// Bulk stock-only processing. Uses the existing products_richmond table and token.
+// GraphQL reads and writes up to 50 variants per call, with compare-and-swap protection.
+async function syncStockBatch(req, res) {
+  const location = process.env.SHOPIFY_LOCATION_ID;
+  if (!/^\d+$/.test(location || "")) return res.status(503).json({ ok: false, error: "Configure SHOPIFY_LOCATION_ID before stock writes" });
+  if (API_VERSION < "2026-04") return res.status(503).json({ ok: false, error: "Stock batches require API version 2026-04 or newer" });
+  const body = req.body || {};
+  let codes = body.item_codes;
+  if (!codes && req.method === "GET") {
+    const { data: pending, error } = await supabase.from(PRODUCT_TABLE).select("item_code")
+      .eq("needs_stock_update", true).not("shopify_variant_id", "is", null)
+      .order("item_code").limit(50);
+    if (error) throw error;
+    codes = pending.map(row => row.item_code);
+    if (!codes.length) return res.status(200).json({ ok: true, stock_only: true, count: 0, results: [] });
+  }
+  if (!Array.isArray(codes) || !codes.length || codes.length > 50 ||
+      codes.some(code => typeof code !== "string" || !/^\d{6}$/.test(code)) || new Set(codes).size !== codes.length) {
+    return res.status(400).json({ ok: false, error: "Provide 1 to 50 unique item_codes" });
+  }
+  const apply = body.apply === true || (req.method === "GET" && req.query.apply === "true");
+  const managedDrafts = new Set(Array.isArray(body.managed_draft_codes) ? body.managed_draft_codes : []);
+  const { data: rows, error } = await supabase.from(PRODUCT_TABLE).select("*").in("item_code", codes);
+  if (error) throw error;
+  const token = await getShopifyAccessToken();
+  const headers = { "X-Shopify-Access-Token": token, "Content-Type": "application/json" };
+  const gql = async (query, variables) => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const response = await shopify.post("/graphql.json", { query, variables }, { headers });
+      if (response.data.errors?.length) {
+        if (attempt < 2 && response.data.errors.every(e => e.extensions?.code === "THROTTLED")) {
+          await new Promise(resolve => setTimeout(resolve, 3000)); continue;
+        }
+        throw new Error("Shopify GraphQL stock query failed: " + response.data.errors.map(e => e.message).join("; "));
+      }
+      if (!response.data.data) throw new Error("Invalid GraphQL data");
+      return response.data.data;
+    }
+  };
+  const query = `query RichmondStockBatch($ids: [ID!]!, $location: ID!) {
+    location(id: $location) { id name isActive }
+    nodes(ids: $ids) { ... on ProductVariant {
+      id sku product { id status vendor tags manualStock: metafield(namespace: "custom", key: "richmond_stock_manual") { value } }
+      inventoryItem { id tracked inventoryLevel(locationId: $location) { quantities(names: ["available"]) { name quantity } } }
+    } }
+  }`;
+  const gid = (type, id) => `gid://shopify/${type}/${toLegacyId(id)}`;
+  const valid = rows.filter(row => /^\d+$/.test(toLegacyId(row.shopify_variant_id) || ""));
+  const ids = valid.map(row => gid("ProductVariant", row.shopify_variant_id));
+  if (new Set(ids).size !== ids.length) return res.status(409).json({ ok: false, error: "Duplicate stored variant IDs: stock writes refused" });
+  const results = codes.filter(code => !rows.some(row => row.item_code === code)).map(item_code => ({ item_code, action: "error", error: "Reference absent from Supabase" }));
+  if (!ids.length) return res.status(200).json({ ok: true, stock_only: true, results: [...results, ...rows.map(row => ({ item_code: row.item_code, action: "skipped", reason: "No stored variant" }))] });
+  const variables = { ids, location: gid("Location", location) };
+  const data = await gql(query, variables);
+  if (!data.location?.isActive) return res.status(409).json({ ok: false, error: "Configured Shopify location is missing or inactive" });
+  const nodes = new Map(data.nodes.filter(Boolean).map(node => [node.id, node]));
+  const changes = [], completed = [];
+  for (const row of rows) {
+    const result = { item_code: row.item_code, action: "skipped" };
+    const node = nodes.get(gid("ProductVariant", row.shopify_variant_id));
+    const stamp = String(row.last_richmond_sync || "");
+    const age = Date.now() - Date.parse(/[zZ]|[+-]\d\d:\d\d$/.test(stamp) ? stamp : stamp + "Z");
+    if (!Number.isFinite(age) || age > 7 * 3600000) result.reason = "Supplier stock older than seven hours; refresh required";
+    else if (!node || node.product.vendor !== "Richmond Interiors" ||
+      node.product.id !== gid("Product", row.shopify_product_id) ||
+      ![row.item_code, row.item_code_new].includes(cleanString(node.sku))) {
+      result.action = "error"; result.error = "Live Shopify product/variant/SKU mismatch";
+    } else if (node.product.manualStock?.value === "true") { result.reason = "Manual stock exception preserved"; completed.push(row.id); }
+    else if (node.product.status !== "ACTIVE" && !(node.product.status === "DRAFT" &&
+      (node.product.tags.includes("richmond-middleware-created") || managedDrafts.has(row.item_code)))) { result.reason = "Archived or merchant draft preserved"; completed.push(row.id); }
+    else if (!node.inventoryItem?.tracked) result.reason = "Inventory tracking configuration preserved";
+    else if (!node.inventoryItem.inventoryLevel) result.reason = "Not stocked at configured location; no relocation";
+    else if (!Number.isInteger(Number(row.stock_quantity)) || row.stock_quantity == null || Number(row.stock_quantity) < 0) {
+      result.action = "error"; result.error = "Invalid supplier stock";
+    } else {
+      const current = node.inventoryItem.inventoryLevel.quantities.find(q => q.name === "available")?.quantity;
+      if (!Number.isInteger(current)) { result.action = "error"; result.error = "Missing live available quantity"; }
+      else {
+        result.before = current; result.desired = Number(row.stock_quantity);
+        result.action = current === result.desired ? "unchanged" : apply ? "pending_verification" : "would_update";
+        if (result.action === "unchanged") completed.push(row.id);
+        else changes.push({ row, node, result });
+      }
+    }
+    results.push(result);
+  }
+  let mutationErrors = [];
+  if (apply && changes.length) {
+    const mutation = `mutation RichmondSetStock($input: InventorySetQuantitiesInput!, $key: String!) {
+      inventorySetQuantities(input: $input) @idempotent(key: $key) {
+        userErrors { field message code }
+      }
+    }`;
+    const response = await gql(mutation, { key: randomUUID(), input: {
+      name: "available", reason: "correction",
+      quantities: changes.map(({node, result}) => ({ inventoryItemId: node.inventoryItem.id,
+        locationId: variables.location, quantity: result.desired, changeFromQuantity: result.before }))
+    } });
+    mutationErrors = response.inventorySetQuantities?.userErrors || [];
+    const verified = await gql(query, variables);
+    const verifiedById = new Map(verified.nodes.filter(Boolean).map(node => [node.id, node]));
+    for (const { row, node, result } of changes) {
+      const after = verifiedById.get(node.id)?.inventoryItem?.inventoryLevel?.quantities.find(q => q.name === "available")?.quantity;
+      result.after = after;
+      if (after === result.desired) { result.action = "updated_and_verified"; completed.push(row.id); }
+      else { result.action = "error"; result.error = "Stock changed concurrently or update rejected; retry this reference only"; }
+    }
+  }
+  if (apply && completed.length) {
+    const { error: saved } = await supabase.from(PRODUCT_TABLE).update({ needs_stock_update: false }).in("id", completed);
+    if (saved) throw saved;
+  }
+  return res.status(200).json({ ok: true, stock_only: true, apply, location: data.location,
+    mutation_errors: mutationErrors, results });
+}
+
 async function searchVariantsBySku(sku, headers) {
   const query = `
     query FindVariantBySku($query: String!) {
@@ -1020,3 +1137,4 @@ shopify.interceptors.response.use(response => response, async error => {
   }
   throw error;
 });
+
