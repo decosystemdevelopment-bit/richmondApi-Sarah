@@ -23,7 +23,7 @@ const shopify = axios.create({
 });
 
 export default function handler(req, res) {
-  return requestCache.run({ products: new Map(), variants: new Map() }, () => handleRequest(req, res));
+  return requestCache.run({ products: new Map(), variants: new Map(), deadline: req.richmondDeadline || null }, () => handleRequest(req, res));
 }
 
 async function handleRequest(req, res) {
@@ -39,6 +39,10 @@ async function handleRequest(req, res) {
   }
 
   try {
+    if (process.env.RICHMOND_CRON_ENABLED === "true" && req.richmondInternalCron !== true &&
+        req.query.plan !== "true" && req.query.dryRun !== "true") {
+      return res.status(409).json({ ok: false, error: "Scheduled pipeline enabled; use its locked entry point" });
+    }
     if (readBooleanQuery(req.query.cleanDuplicateImages, false)) {
       return await cleanDuplicateImages(req, res);
     }
@@ -78,7 +82,7 @@ async function handleRequest(req, res) {
       "Content-Type": "application/json"
     };
 
-    const products = await fetchProductsToSync({ id, itemCode, limit, linkOnly, syncImages });
+    const products = await fetchProductsToSync({ id, itemCode, limit, linkOnly, syncImages, phase });
 
     if (products.length === 0) {
       return res.status(200).json({
@@ -233,6 +237,12 @@ async function syncOneProduct({
         return result;
       }
       result.action = "updated";
+      if (ownedDraft && !product.last_shopify_sync && process.env.RICHMOND_AUTO_PUBLISH === "true" && !dryRun) {
+        const { error } = await supabase.from("richmond_publication_queue").upsert({
+          item_code: product.item_code, product_id: String(match.productId), status: "pending"
+        }, { onConflict: "item_code", ignoreDuplicates: true });
+        if (error) throw error;
+      }
     }
 
     if (linkOnly) {
@@ -300,8 +310,9 @@ async function syncOneProduct({
     if (media && product.needs_images_update) {
       if (syncImages) {
         const imageResult = await appendMissingImages(product, match.productId, headers);
-        clearedFlags.needs_images_update = false;
-        result.synced.push("images");
+        if (imageResult.skippedInvalid > 0) throw new Error("Supplier images unavailable; retry required before publication");
+        clearedFlags.needs_images_update = Boolean(imageResult.remaining);
+        result.synced.push(imageResult.remaining ? "images_partial" : "images");
 
         if (imageResult.skippedInvalid > 0) {
           result.skipped.push(`invalid_images:${imageResult.skippedInvalid}`);
@@ -343,7 +354,7 @@ async function syncOneProduct({
   }
 }
 
-async function fetchProductsToSync({ id, itemCode, limit, linkOnly, syncImages }) {
+async function fetchProductsToSync({ id, itemCode, limit, linkOnly, syncImages, phase = "all" }) {
   if (id) {
     const { data, error } = await supabase
       .from(PRODUCT_TABLE)
@@ -380,15 +391,13 @@ async function fetchProductsToSync({ id, itemCode, limit, linkOnly, syncImages }
     return data || [];
   }
 
-  const pendingFlags = [
-    "needs_stock_update.eq.true",
-    "needs_price_update.eq.true",
-    "needs_compare_at_price_update.eq.true",
-    "needs_status_update.eq.true",
-    "needs_description_update.eq.true"
-  ];
+  const pendingFlags = phase === "priority" ? ["needs_price_update.eq.true", "needs_compare_at_price_update.eq.true"] :
+    phase === "information" ? ["needs_status_update.eq.true", "needs_description_update.eq.true"] :
+    phase === "images" ? ["needs_images_update.eq.true"] : [
+      "needs_price_update.eq.true", "needs_compare_at_price_update.eq.true", "needs_status_update.eq.true", "needs_description_update.eq.true"
+    ];
 
-  if (syncImages) {
+  if (syncImages && phase === "all") {
     pendingFlags.push("needs_images_update.eq.true");
   }
 
@@ -497,6 +506,7 @@ async function createShopifyProduct(product, headers, syncInformation = true) {
       vendor: "Richmond Interiors",
       product_type: product.product_type || "",
       status: product.status === "archived" ? "archived" : "draft",
+      published_at: null,
       tags: "richmond-middleware-created",
       variants: [
         {
@@ -515,6 +525,22 @@ async function createShopifyProduct(product, headers, syncInformation = true) {
   const variant = created.variants[0];
 
   cacheProduct(created);
+  // Persist identity BEFORE the following calls: a failed image/metafield request must not create a second product.
+  const match = { productId: created.id, variantId: variant.id, inventoryItemId: variant.inventory_item_id };
+  await saveShopifyIds(product.id, match);
+  if (process.env.RICHMOND_AUTO_PUBLISH === "true") {
+    const { error } = await supabase.from("richmond_publication_queue").upsert({
+      item_code: product.item_code, product_id: String(created.id), status: "pending"
+    }, { onConflict: "item_code", ignoreDuplicates: true });
+    if (error) throw error;
+  }
+  const location = process.env.SHOPIFY_LOCATION_ID;
+  if (location) {
+    // Only a brand-new product is connected here; never relocate an existing merchant inventory item.
+    await shopify.post("/inventory_levels/connect.json", {
+      inventory_item_id: variant.inventory_item_id, location_id: Number(location)
+    }, { headers });
+  }
   if (syncInformation) await upsertProductMetafields(product, created.id, headers);
 
   return {
@@ -588,7 +614,8 @@ async function appendMissingImages(product, productId, headers) {
   const summary = {
     added: 0,
     alreadyExists: 0,
-    skippedInvalid: 0
+    skippedInvalid: 0,
+    remaining: 0
   };
 
   if (desiredUrls.length === 0) return summary;
@@ -604,6 +631,10 @@ async function appendMissingImages(product, productId, headers) {
     const filename = filenameFromUrl(url);
     if (filename && existingFilenames.has(filename)) {
       summary.alreadyExists += 1;
+      continue;
+    }
+    if (requestCache.getStore()?.deadline && summary.added >= 10) {
+      summary.remaining += 1;
       continue;
     }
 
@@ -850,7 +881,18 @@ async function syncStockBatch(req, res) {
     else if (node.product.status !== "ACTIVE" && !(node.product.status === "DRAFT" &&
       (node.product.tags.includes("richmond-middleware-created") || managedDrafts.has(row.item_code)))) { result.reason = "Archived or merchant draft preserved"; completed.push(row.id); }
     else if (!node.inventoryItem?.tracked) result.reason = "Inventory tracking configuration preserved";
-    else if (!node.inventoryItem.inventoryLevel) result.reason = "Not stocked at configured location; no relocation";
+    else if (!node.inventoryItem.inventoryLevel) {
+      // Only a pending, explicitly authorised NEW publication can repair its initial connection.
+      const { data: authorised, error } = await supabase.from("richmond_publication_queue")
+        .select("product_id,status").eq("item_code", row.item_code).maybeSingle();
+      if (error) throw error;
+      if (authorised?.status === "pending" && String(authorised.product_id) === String(row.shopify_product_id) && apply) {
+        await shopify.post("/inventory_levels/connect.json", {
+          inventory_item_id: Number(toLegacyId(node.inventoryItem.id)), location_id: Number(location)
+        }, { headers });
+        result.reason = "New inventory connected; stock verification deferred to next batch";
+      } else result.reason = "Not stocked at configured location; no relocation";
+    }
     else if (!Number.isInteger(Number(row.stock_quantity)) || row.stock_quantity == null || Number(row.stock_quantity) < 0) {
       result.action = "error"; result.error = "Invalid supplier stock";
     } else {
@@ -1205,6 +1247,12 @@ async function cleanDuplicateImages(req, res) {
 // Serialize Shopify calls inside each invocation and respect temporary throttling.
 let lastShopifyRequest = 0;
 shopify.interceptors.request.use(async config => {
+  const deadline = requestCache.getStore()?.deadline;
+  if (deadline) {
+    const remaining = deadline - Date.now();
+    if (remaining < 10000) throw new Error("Invocation budget reached; pending work preserved");
+    config.timeout = Math.min(Number(config.timeout) || 45000, remaining - 3000);
+  }
   const wait = Math.max(0, 700 - (Date.now() - lastShopifyRequest));
   if (wait) await new Promise(resolve => setTimeout(resolve, wait));
   lastShopifyRequest = Date.now();
