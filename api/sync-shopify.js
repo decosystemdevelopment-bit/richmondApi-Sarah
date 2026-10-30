@@ -19,11 +19,29 @@ const shopify = axios.create({
 });
 
 export default async function handler(req, res) {
+  res.setHeader("Cache-Control", "no-store");
+  const expectedSecret = process.env.AUDIT_SECRET;
+  if (!expectedSecret || req.headers.authorization !== `Bearer ${expectedSecret}`) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
   if (!["GET", "POST"].includes(req.method)) {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
   try {
+    if (readBooleanQuery(req.query.plan, false)) {
+      const rows = [];
+      for (let offset = 0; ; offset += 500) {
+        const { data, error } = await supabase.from(PRODUCT_TABLE)
+          .select("item_code,title,status,shopify_product_id,last_richmond_sync,last_sync_error,needs_stock_update,needs_price_update,needs_compare_at_price_update,needs_status_update,needs_description_update,needs_images_update")
+          .order("item_code").range(offset, offset + 499);
+        if (error) throw error;
+        rows.push(...data);
+        if (data.length < 500) break;
+      }
+      return res.status(200).json({ ok: true, products: rows });
+    }
     const startedAt = Date.now();
     const now = new Date().toISOString();
 
@@ -51,7 +69,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const locationId = await getLocationId(headers);
+    const locationId = process.env.SHOPIFY_LOCATION_ID || null;
     const results = [];
 
     for (const product of products) {
@@ -81,11 +99,11 @@ export default async function handler(req, res) {
       durationMs: Date.now() - startedAt
     });
   } catch (error) {
-    console.error("Shopify sync failed:", error.response?.data || error.message);
+    console.error("Shopify sync failed; inspect response status, not credentials.");
     return res.status(500).json({
       ok: false,
-      error: error.message,
-      details: error.response?.data || null
+      error: "Shopify sync failed",
+      upstream_status: error.response?.status || null
     });
   }
 }
@@ -119,7 +137,7 @@ async function syncOneProduct({
         `No Shopify product found for SKU(s): ${skuCandidates.join(", ")}. ` +
         "Creation is disabled to avoid duplicates.";
 
-      await markProductError(product.id, message);
+      if (!dryRun) await markProductError(product.id, message);
       result.action = "not_found";
       result.errors.push(message);
       return result;
@@ -134,7 +152,15 @@ async function syncOneProduct({
       return result;
     }
 
+    if (!match && product.status !== "active") {
+      return { ...result, action: "skipped", skipped: ["supplier_not_active"] };
+    }
     if (!match) {
+      const supplierStatus = product.raw_data?.details?.["Product Status"];
+      if (supplierStatus && supplierStatus !== "Actief") {
+        return { ...result, action: "skipped", skipped: ["no_creation_for_end_of_series"] };
+      }
+      if (!(Number(product.price) > 0)) throw new Error("Invalid price: creation refused");
       if (dryRun) {
         result.action = "would_create";
         return result;
@@ -143,6 +169,20 @@ async function syncOneProduct({
       match = await createShopifyProduct(product, headers);
       result.action = "created";
     } else {
+      const live = await fetchProduct(match.productId, headers);
+      if (live.vendor !== "Richmond Interiors") throw new Error("Vendor mismatch");
+      const exactVariant = (live.variants || []).find(v => String(v.id) === String(match.variantId));
+      if (!exactVariant || !skuCandidates.includes(cleanString(exactVariant.sku))) throw new Error("Stored SKU mismatch");
+      if (live.status !== "active") {
+        result.action = "skipped";
+        result.skipped.push("shopify_" + live.status + "_preserved");
+        return result;
+      }
+      if (product.status !== "active") {
+        result.action = "skipped";
+        result.skipped.push("supplier_discontinued_requires_review");
+        return result;
+      }
       result.action = "updated";
     }
 
@@ -180,16 +220,18 @@ async function syncOneProduct({
     const clearedFlags = {};
 
     if (product.needs_status_update || product.needs_description_update) {
-      await updateProductDetails(product, match.productId, headers);
+      // Preserve existing Shopify title/body/status; refresh the existing technical metafields.
+      await upsertProductMetafields(product, match.productId, headers);
+      result.skipped.push("existing_title_description_status_preserved");
 
       if (product.needs_status_update) {
         clearedFlags.needs_status_update = false;
-        result.synced.push("status");
+        result.skipped.push("status_preserved");
       }
 
       if (product.needs_description_update) {
         clearedFlags.needs_description_update = false;
-        result.synced.push("description");
+        result.synced.push("technical_metafields");
       }
     }
 
@@ -200,7 +242,7 @@ async function syncOneProduct({
       result.synced.push("price");
     }
 
-    if (product.needs_stock_update) {
+    if (product.needs_stock_update && locationId) {
       const inventoryItemId =
         match.inventoryItemId || (await fetchInventoryItemId(match.variantId, headers));
 
@@ -209,6 +251,9 @@ async function syncOneProduct({
       result.synced.push("stock");
     }
 
+    if (product.needs_stock_update && !locationId) {
+      result.skipped.push("stock_destination_not_configured");
+    }
     if (product.needs_images_update) {
       if (syncImages) {
         const imageResult = await appendMissingImages(product, match.productId, headers);
@@ -223,7 +268,7 @@ async function syncOneProduct({
       }
     }
 
-    await supabase
+    const { error: saveError } = await supabase
       .from(PRODUCT_TABLE)
       .update({
         ...clearedFlags,
@@ -236,6 +281,7 @@ async function syncOneProduct({
         sync_retry_count: 0
       })
       .eq("id", product.id);
+    if (saveError) throw saveError;
 
     return {
       ...result,
@@ -246,7 +292,7 @@ async function syncOneProduct({
   } catch (error) {
     const message = formatShopifyError(error);
     console.error(`Shopify sync error for ${product.item_code}:`, message);
-    await markProductError(product.id, message);
+    if (!dryRun) await markProductError(product.id, message);
 
     result.action = "error";
     result.errors.push(message);
@@ -362,6 +408,15 @@ async function findShopifyMatch(product, skuCandidates, headers) {
     const exactMatches = variants.filter((variant) => cleanString(variant.sku) === sku);
 
     if (exactMatches.length > 1) {
+      const activeMatches = [];
+      for (const variant of exactMatches) {
+        const live = await fetchProduct(variant.product_id, headers);
+        if (live.vendor === "Richmond Interiors" && live.status === "active") activeMatches.push(variant);
+      }
+      if (activeMatches.length === 1) {
+        const variant = activeMatches[0];
+        return { productId: variant.product_id, variantId: variant.id, inventoryItemId: variant.inventory_item_id };
+      }
       throw new Error(
         `Duplicate Shopify variants found for SKU ${sku}. Fix duplicates in Shopify before syncing.`
       );
@@ -431,6 +486,11 @@ async function updateProductDetails(product, productId, headers) {
 }
 
 async function updateVariantPricing(product, variantId, headers) {
+  if (!(Number(product.price) > 0)) throw new Error("Invalid price: update refused");
+  const current = await fetchVariant(variantId, headers);
+  const equal = (a, b) => (a == null || a === "") ? (b == null || b === "") :
+    (b != null && b !== "" && Math.abs(Number(a) - Number(b)) < 0.009);
+  if (equal(current.price, product.price) && equal(current.compare_at_price, product.compare_at_price)) return;
   const payload = {
     variant: {
       id: Number(variantId),
@@ -446,12 +506,20 @@ async function updateVariantPricing(product, variantId, headers) {
 }
 
 async function setInventoryLevel(product, inventoryItemId, locationId, headers) {
+  const desired = Number.parseInt(product.stock_quantity, 10);
+  if (!Number.isFinite(desired) || desired < 0) throw new Error("Unknown supplier stock; quantity preserved");
+  const response = await shopify.get("/inventory_levels.json", {
+    headers, params: { inventory_item_ids: String(inventoryItemId), location_ids: String(locationId) }
+  });
+  const current = response.data.inventory_levels?.find(l => String(l.location_id) === String(locationId));
+  if (!current) throw new Error("Variant not assigned to configured stock location; no relocation performed");
+  if (current.available === desired) return;
   await shopify.post(
     "/inventory_levels/set.json",
     {
       location_id: Number(locationId),
       inventory_item_id: Number(inventoryItemId),
-      available: Number.parseInt(product.stock_quantity || product.stock || 0, 10)
+      available: desired
     },
     { headers }
   );
@@ -726,7 +794,7 @@ function chooseVariant(variants, skuCandidates) {
   }
 
   if (exact.length === 1) return exact[0];
-  if (variants.length === 1) return variants[0];
+  // No fallback to an unrelated single variant.
 
   return null;
 }
@@ -763,7 +831,7 @@ function normalizeImageUrl(value) {
   }
 }
 
-function filenameFromUrl(url) {
+function rawFilenameFromUrl(url) {
   const text = cleanString(url);
   if (!text) return "";
 
@@ -861,3 +929,28 @@ function requireAnyEnv(names) {
 
   throw new Error(`Missing required environment variable: ${names.join(" or ")}`);
 }
+
+function filenameFromUrl(url) {
+  return rawFilenameFromUrl(url)
+    .replace(/_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/ig, "")
+    .replace(/_\\d+x\\d*(?=\\.[^.]+$)/, "");
+}
+
+// Serialize Shopify calls inside each invocation and respect temporary throttling.
+let lastShopifyRequest = 0;
+shopify.interceptors.request.use(async config => {
+  const wait = Math.max(0, 700 - (Date.now() - lastShopifyRequest));
+  if (wait) await new Promise(resolve => setTimeout(resolve, wait));
+  lastShopifyRequest = Date.now();
+  return config;
+});
+shopify.interceptors.response.use(response => response, async error => {
+  const config = error.config;
+  if (error.response?.status === 429 && config && (config._syncRetries || 0) < 3) {
+    config._syncRetries = (config._syncRetries || 0) + 1;
+    const delay = Math.min(10000, Math.max(2000, (Number(error.response.headers["retry-after"]) || 2) * 1000));
+    await new Promise(resolve => setTimeout(resolve, delay));
+    return shopify.request(config);
+  }
+  throw error;
+});
