@@ -1,6 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
+    "api/cron-richmond.js": { "maxDuration": 300 },
     "api/sync-richmond.js": { "maxDuration": 300 },
     "api/sync-shopify.js": { "maxDuration": 300 }
   }
