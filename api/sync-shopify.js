@@ -121,11 +121,22 @@ async function handleRequest(req, res) {
       durationMs: Date.now() - startedAt
     });
   } catch (error) {
-    console.error("Shopify sync failed; inspect response status, not credentials.");
+    const cleanup = requestCache.getStore()?.cleanup;
+    const diagnostic = cleanup ? {
+      stage: cleanup.stage,
+      product_id: cleanup.product_id,
+      confirmed_deleted: cleanup.deleted,
+      upstream_status: error.response?.status || null,
+      error_type: String(error.name || "Error"),
+      error_code: /^[A-Z_\d]+$/.test(String(error.code || "")) ? error.code : null,
+      verification_error: ["Image deletion verification failed", "Unexpected gallery change"].includes(error.message) ? error.message : null
+    } : null;
+    console.error("Shopify sync failed", diagnostic || { upstream_status: error.response?.status || null });
     return res.status(500).json({
       ok: false,
       error: "Shopify sync failed",
-      upstream_status: error.response?.status || null
+      upstream_status: error.response?.status || null,
+      ...(diagnostic ? { diagnostic } : {})
     });
   }
 }
@@ -1133,13 +1144,18 @@ function richmondImageReference(alt, code) {
 
 // Only images explicitly labelled by this importer are eligible. No global file deletion.
 async function cleanDuplicateImages(req, res) {
+  const diagnostic = { stage: "validate_request", product_id: null, deleted: [] };
+  requestCache.getStore().cleanup = diagnostic;
   if (req.method !== "POST") return res.status(405).json({ ok: false, error: "POST required" });
   const body = req.body || {};
   const productId = String(body.product_id || "");
   const code = String(body.item_code || "");
+  diagnostic.product_id = productId;
   if (!/^\d+$/.test(productId) || !/^\d+$/.test(code)) return res.status(400).json({ ok: false, error: "Invalid target" });
+  diagnostic.stage = "read_token";
   const headers = { "X-Shopify-Access-Token": await getShopifyAccessToken() };
   const get = async () => (await shopify.get(`/products/${productId}.json`, { headers })).data.product;
+  diagnostic.stage = "read_product";
   const product = await get();
   if (product.vendor !== "Richmond Interiors" || !product.variants.some(v => String(v.sku) === code)) {
     return res.status(409).json({ ok: false, error: "Product identity mismatch" });
@@ -1162,10 +1178,13 @@ async function cleanDuplicateImages(req, res) {
   const apply = body.apply === true;
   const deleted = [];
   if (apply) for (const image of selected) {
+    diagnostic.stage = "delete_product_image";
     await shopify.delete(`/products/${productId}/images/${image.id}.json`, { headers });
     deleted.push(String(image.id));
+    diagnostic.deleted.push(String(image.id));
   }
   if (apply && deleted.length) {
+    diagnostic.stage = "verify_gallery";
     const after = await get();
     if (after.images.some(i => deleted.includes(String(i.id)))) throw Error("Image deletion verification failed");
     const keptIds = (product.images || []).filter(i => !deleted.includes(String(i.id))).map(i => String(i.id));
