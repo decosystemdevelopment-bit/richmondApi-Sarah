@@ -150,22 +150,41 @@ async function publish(entry,row){
 }
 
 async function preflight(res){
+  let stage='supabase_tables';
+  const diagnostic={};
+  const fail=(error,extra={})=>res.status(503).json({ok:false,read_only:true,stage,error,...diagnostic,...extra});
   try{
-    for(const t of ['richmond_cron_lock','richmond_cron_runs','richmond_cron_tasks','richmond_publication_queue'])check(await db.from(t).select('*').limit(1));
-    const token=check(await db.from('shopify_auth').select('access_token').single())?.access_token;
-    if(!token)throw Error('Shopify token missing');
+    for(const t of ['richmond_cron_lock','richmond_cron_runs','richmond_cron_tasks','richmond_publication_queue']){
+      stage=`supabase_table:${t}`;
+      const result=await db.from(t).select('*').limit(1);
+      if(result.error)return fail('Cannot read tracking table',{database_code:result.error.code||null});
+    }
+    stage='supabase_shopify_auth';
+    const authResult=await db.from('shopify_auth').select('access_token').single();
+    if(authResult.error)return fail('Cannot read a unique Shopify connection',{database_code:authResult.error.code||null});
+    const token=authResult.data?.access_token;
+    if(!token)return fail('Shopify token missing');
+    stage='shopify_configuration';
     const shop=String(process.env.SHOPIFY_SHOP||'').replace(/^https?:\/\//,'').replace(/\/$/,'');
-    if(!/^[a-z0-9-]+\.myshopify\.com$/i.test(shop))throw Error('Shopify domain invalid');
-    const response=await axios.post(`https://${shop}/admin/api/${process.env.SHOPIFY_API_VERSION||'2026-04'}/graphql.json`,{
-      query:'{currentAppInstallation{accessScopes{handle}} publications(first:100){nodes{id name} pageInfo{hasNextPage}}}'
-    },{headers:{'X-Shopify-Access-Token':token},timeout:30000});
-    if(response.data.errors?.length||!response.data.data)throw Error('Shopify publication access rejected: check read_publications/write_publications');
-    const data=response.data.data;
-    const scopes=data.currentAppInstallation.accessScopes.map(s=>s.handle);
+    if(!/^[a-z0-9-]+\.myshopify\.com$/i.test(shop))return fail('Shopify domain invalid');
+    const endpoint=`https://${shop}/admin/api/${process.env.SHOPIFY_API_VERSION||'2026-04'}/graphql.json`;
+    const options={headers:{'X-Shopify-Access-Token':token},timeout:30000,maxRedirects:0};
+    stage='shopify_access_scopes';
+    const response=await axios.post(endpoint,{query:'{currentAppInstallation{accessScopes{handle}}}'},options);
+    if(response.data.errors?.length||!response.data.data?.currentAppInstallation)return fail('Cannot read Shopify app installation',{graphql_codes:(response.data.errors||[]).map(e=>e.extensions?.code||'UNKNOWN')});
+    const scopes=response.data.data.currentAppInstallation.accessScopes.map(s=>s.handle);
+    diagnostic.granted_scopes=scopes;
     const missing=['write_products','write_inventory','write_publications'].filter(s=>!scopes.includes(s));
+    let publications=null;
+    if(scopes.includes('read_publications')||scopes.includes('write_publications')){
+      stage='shopify_publications';
+      const publicationResponse=await axios.post(endpoint,{query:'{publications(first:100){nodes{id name} pageInfo{hasNextPage}}}'},options);
+      if(publicationResponse.data.errors?.length||!publicationResponse.data.data?.publications)return fail('Cannot read publications',{graphql_codes:(publicationResponse.data.errors||[]).map(e=>e.extensions?.code||'UNKNOWN')});
+      publications=publicationResponse.data.data.publications;
+    }
     const configurationMissing=[];
     if(!/^gid:\/\/shopify\/Publication\/\d+$/.test(process.env.SHOPIFY_ONLINE_STORE_PUBLICATION_ID||''))configurationMissing.push('SHOPIFY_ONLINE_STORE_PUBLICATION_ID');
     if(!/^\d+$/.test(process.env.SHOPIFY_LOCATION_ID||''))configurationMissing.push('SHOPIFY_LOCATION_ID');
-    return res.status(200).json({ok:!missing.length&&!configurationMissing.length,read_only:true,missing_scopes:missing,configuration_missing:configurationMissing,publications:data.publications,configured_publication:process.env.SHOPIFY_ONLINE_STORE_PUBLICATION_ID||null,configured_location:process.env.SHOPIFY_LOCATION_ID||null,enabled:process.env.RICHMOND_CRON_ENABLED==='true'});
-  }catch{return res.status(503).json({ok:false,read_only:true,error:'Preflight failed: check SQL installation, service_role key, Shopify token and publication scopes'});}
+    return res.status(200).json({ok:!missing.length&&!configurationMissing.length,read_only:true,granted_scopes:scopes,missing_scopes:missing,configuration_missing:configurationMissing,publications,configured_publication:process.env.SHOPIFY_ONLINE_STORE_PUBLICATION_ID||null,configured_location:process.env.SHOPIFY_LOCATION_ID||null,enabled:process.env.RICHMOND_CRON_ENABLED==='true'});
+  }catch(error){return fail('Preflight request failed',{upstream_status:error.response?.status||null,error_type:String(error.name||'Error'),network_code:/^[A-Z_\d]+$/.test(error.code||'')?error.code:null});}
 }
