@@ -24,7 +24,7 @@ async function invoke(handler, query, body, deadline) {
 async function record(job,code,result,problem=false) {
   const current=check(await db.from('richmond_cron_tasks').select('attempts').eq('job',job).eq('item_code',code).maybeSingle());
   const attempts=problem?(current?.attempts||0)+1:0;
-  const delay=problem?Math.min(24*60,5*2**Math.min(attempts,9)):result.action==='skipped'?(/^Waiting for/.test(result.reason||'')?5:24*60):0;
+  const delay=problem?Math.min(24*60,5*2**Math.min(attempts,9)):result.action==='skipped'?(/^(Waiting for|New inventory connected|Supplier stock older)/.test(result.reason||'')?5:24*60):0;
   check(await db.from('richmond_cron_tasks').upsert({job,item_code:code,attempts,next_at:new Date(Date.now()+delay*60000).toISOString(),last_result:result},{onConflict:'job,item_code'}));
 }
 function eligible(rows,job,tasks) {
@@ -52,12 +52,18 @@ export default async function handler(req,res){
         summary.absent_from_supplier=(await all(table,'item_code,shopify_product_id')).filter(r=>!source.has(r.item_code)).map(r=>({item_code:r.item_code,product_id:r.shopify_product_id}));
       }
     }else{
-      const rows=await all(table,'item_code,shopify_product_id,shopify_variant_id,needs_stock_update,needs_price_update,needs_compare_at_price_update,needs_description_update,needs_status_update,needs_images_update');
+      const catalogue=check(await db.from('richmond_cron_runs').select('started_at,summary').eq('job','catalogue').eq('status','success').order('started_at',{ascending:false}).limit(1).maybeSingle());
+      const sourceCodes=catalogue?.summary?.refresh?.item_codes;
+      if(!Array.isArray(sourceCodes)||!sourceCodes.length||Date.now()-Date.parse(catalogue.started_at)>18*3600000)throw Error('Supplier catalogue missing or stale; refresh catalogue before Shopify writes');
+      const source=new Set(sourceCodes);
+      const storedRows=await all(table,'item_code,shopify_product_id,shopify_variant_id,needs_stock_update,needs_price_update,needs_compare_at_price_update,needs_description_update,needs_status_update,needs_images_update');
+      const rows=storedRows.filter(r=>source.has(r.item_code));
+      summary.absent_references_preserved=storedRows.length-rows.length;
       const tasks=await all('richmond_cron_tasks','job,item_code,attempts,next_at');
       if(job==='publish'){
         if(process.env.RICHMOND_AUTO_PUBLISH!=='true')throw Error('Automatic publication disabled');
         const queue=await all('richmond_publication_queue');
-        for(const entry of eligible(queue.filter(q=>q.status==='pending'),'publish',tasks).slice(0,5)){
+        for(const entry of eligible(queue.filter(q=>q.status==='pending'&&source.has(q.item_code)),'publish',tasks).slice(0,5)){
           if(Date.now()-started>180000)break;
           await work(entry.item_code,async()=>{
             const row=check(await db.from(table).select('*').eq('item_code',entry.item_code).maybeSingle());
@@ -68,7 +74,7 @@ export default async function handler(req,res){
         const pending=eligible(rows.filter(r=>r.needs_stock_update&&r.shopify_variant_id),'stock',tasks).slice(0,50);
         if(pending.length){
           const output=await invoke(sync,{stockBatch:'true'},{item_codes:pending.map(r=>r.item_code),apply:true},started+240000);
-          for(const result of output.results||[]){const problem=result.action==='error'||result.action==='skipped'&&!/Manual stock|merchant draft/.test(result.reason||'');await record(job,result.item_code,result,problem);summary.processed++;summary.errors+=Number(problem);summary.results.push(result);}
+          for(const result of output.results||[]){const problem=result.action==='error';await record(job,result.item_code,result,problem);summary.processed++;summary.errors+=Number(problem);if(result.action==='skipped')summary.skipped=(summary.skipped||0)+1;summary.results.push(result);}
         }
       }else{
         const pending=eligible(rows.filter(r=>flags[job].some(f=>r[f])||(job==='prices'&&!r.shopify_product_id)),job,tasks).slice(0,5);
