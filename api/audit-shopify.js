@@ -40,7 +40,7 @@ export default async function handler(req, res) {
       params: {
         limit: 250,
         ...(cursor ? { page_info: cursor } : {
-          fields: "id,title,handle,vendor,status,template_suffix,updated_at,variants,images"
+          fields: "id,title,handle,vendor,status,template_suffix,updated_at,created_at,published_at,body_html,tags,product_type,variants,images"
         })
       },
       timeout: 25000,
@@ -50,6 +50,8 @@ export default async function handler(req, res) {
     const products = response.data.products.map(p => ({
       id: String(p.id), title: p.title, handle: p.handle, vendor: p.vendor,
       status: p.status, template_suffix: p.template_suffix, updated_at: p.updated_at,
+      created_at: p.created_at, published_at: p.published_at,
+      body_html: p.body_html, tags: p.tags, product_type: p.product_type,
       images: (p.images || []).map(i => ({ id: String(i.id), src: i.src, alt: i.alt })),
       variants: (p.variants || []).map(v => ({
         id: String(v.id), sku: v.sku, barcode: v.barcode, title: v.title,
