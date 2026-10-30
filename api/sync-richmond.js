@@ -38,8 +38,9 @@ const http = axios.create({
 
 export default async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
-  const expectedSecret = process.env.AUDIT_SECRET;
-  if (!expectedSecret || req.headers.authorization !== `Bearer ${expectedSecret}`) {
+  const authorised = [process.env.AUDIT_SECRET, process.env.CRON_SECRET].filter(Boolean)
+    .some(secret => req.headers.authorization === `Bearer ${secret}`);
+  if (!authorised) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
 
@@ -48,6 +49,9 @@ export default async function handler(req, res) {
   }
 
   try {
+    if (readBooleanQuery(req.query.stockOnly, false)) {
+      return res.status(200).json(await refreshStockOnly());
+    }
     const startedAt = Date.now();
     const now = new Date().toISOString();
 
@@ -209,6 +213,44 @@ export default async function handler(req, res) {
       error: "Richmond sync failed; check supplier access and database schema"
     });
   }
+}
+
+async function refreshStockOnly() {
+  const response = await http.get(richmondApi.stock);
+  const rows = asArray(response.data, "stocklevels");
+  const codes = rows.map(getPrimaryCode);
+  if (!rows.length || codes.some(code => !code) || new Set(codes).size !== codes.length) {
+    throw new Error("Invalid stock snapshot");
+  }
+  const existing = await fetchExistingProducts(codes);
+  const byCode = new Map(existing.map(row => [row.item_code, row]));
+  const now = new Date().toISOString();
+  const updates = [];
+  const invalid = [];
+  for (const stock of rows) {
+    const code = getPrimaryCode(stock), old = byCode.get(code);
+    if (!old) continue; // Stock refresh never creates products.
+    const details = old.raw_data?.details || {};
+    const data = normalizeStock(details, stock);
+    if (data.stock_quantity === null || data.stock_quantity < 0) { invalid.push(code); continue; }
+    const availableFrom = cleanString(stock["Available from Week"] || details["Available from Week"]);
+    const fingerprint = generateHash({
+      stock_quantity: data.stock_quantity, stock_indicator: data.stock_indicator,
+      stock_bucket: data.stock_bucket, online_availability_text: data.online_availability_text,
+      online_next_availability_text: data.online_next_availability_text, available_from: availableFrom
+    });
+    updates.push({ item_code: code, ...data, stock: data.stock_quantity,
+      available_from: availableFrom, richmond_stock_hash: fingerprint,
+      needs_stock_update: Boolean(old.needs_stock_update) || old.richmond_stock_hash !== fingerprint,
+      raw_data: { ...(old.raw_data || {}), stock }, last_richmond_sync: now });
+  }
+  for (const chunk of chunkArray(updates, 100)) {
+    const { error } = await supabase.from(PRODUCT_TABLE).upsert(chunk, { onConflict: "item_code", defaultToNull: false });
+    if (error) throw error;
+  }
+  return { ok: true, stock_only: true, snapshot_at: now, supplier_rows: rows.length,
+    updated: updates.length, item_codes: updates.map(row => row.item_code),
+    invalid_stock_codes: invalid, unknown_references: codes.filter(code => !byCode.has(code)) };
 }
 
 function normalizeProduct(details, pricing, stock, descriptions) {
@@ -641,4 +683,5 @@ function requireAnyEnv(names) {
 
   throw new Error(`Missing required environment variable: ${names.join(" or ")}`);
 }
+
 
