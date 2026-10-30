@@ -39,6 +39,9 @@ async function handleRequest(req, res) {
   }
 
   try {
+    if (readBooleanQuery(req.query.cleanDuplicateImages, false)) {
+      return await cleanDuplicateImages(req, res);
+    }
     if (readBooleanQuery(req.query.stockBatch, false)) {
       return await syncStockBatch(req, res);
     }
@@ -582,7 +585,7 @@ async function appendMissingImages(product, productId, headers) {
   const existingImages = (await fetchProduct(productId, headers)).images || [];
   const existingFilenames = new Set(
     existingImages
-      .map((image) => filenameFromUrl(image.src || image.alt || ""))
+      .flatMap((image) => [filenameFromUrl(image.src || ""), richmondImageReference(image.alt, product.item_code)])
       .filter(Boolean)
   );
 
@@ -1116,7 +1119,61 @@ function requireAnyEnv(names) {
 function filenameFromUrl(url) {
   return rawFilenameFromUrl(url)
     .replace(/_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/ig, "")
-    .replace(/_\\d+x\\d*(?=\\.[^.]+$)/, "");
+    .replace(/_\d+x\d*(?=\.[^.]+$)/, "")
+    .replace(/_2B/ig, "+")
+    .replace(/^-+/, "")
+    .normalize("NFC").toLowerCase();
+}
+
+function richmondImageReference(alt, code) {
+  const prefix = `Richmond ${code} `;
+  if (!String(alt || "").startsWith(prefix)) return "";
+  return filenameFromUrl(String(alt).slice(prefix.length));
+}
+
+// Only images explicitly labelled by this importer are eligible. No global file deletion.
+async function cleanDuplicateImages(req, res) {
+  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "POST required" });
+  const body = req.body || {};
+  const productId = String(body.product_id || "");
+  const code = String(body.item_code || "");
+  if (!/^\d+$/.test(productId) || !/^\d+$/.test(code)) return res.status(400).json({ ok: false, error: "Invalid target" });
+  const headers = { "X-Shopify-Access-Token": await getShopifyAccessToken() };
+  const get = async () => (await shopify.get(`/products/${productId}.json`, { headers })).data.product;
+  const product = await get();
+  if (product.vendor !== "Richmond Interiors" || !product.variants.some(v => String(v.sku) === code)) {
+    return res.status(409).json({ ok: false, error: "Product identity mismatch" });
+  }
+  const protectedIds = new Set(product.variants.map(v => String(v.image_id || "")));
+  const groups = new Map();
+  for (const image of product.images || []) {
+    const ref = richmondImageReference(image.alt, code);
+    if (!ref) continue;
+    if (!groups.has(ref)) groups.set(ref, []);
+    groups.get(ref).push(image);
+  }
+  const candidates = [];
+  for (const group of groups.values()) {
+    // Keep the first gallery occurrence, and every image associated with a variant.
+    for (const image of group.slice(1)) if (!protectedIds.has(String(image.id))) candidates.push(image);
+  }
+  const approved = new Set((Array.isArray(body.approved_ids) ? body.approved_ids : []).map(String));
+  const selected = candidates.filter(i => approved.has(String(i.id))).slice(0, 10);
+  const apply = body.apply === true;
+  const deleted = [];
+  if (apply) for (const image of selected) {
+    await shopify.delete(`/products/${productId}/images/${image.id}.json`, { headers });
+    deleted.push(String(image.id));
+  }
+  if (apply && deleted.length) {
+    const after = await get();
+    if (after.images.some(i => deleted.includes(String(i.id)))) throw Error("Image deletion verification failed");
+    const keptIds = (product.images || []).filter(i => !deleted.includes(String(i.id))).map(i => String(i.id));
+    if (keptIds.some(id => !after.images.some(i => String(i.id) === id))) throw Error("Unexpected gallery change");
+  }
+  return res.status(200).json({ ok: true, apply, product_id: productId, item_code: code,
+    candidates: candidates.map(i => ({ id: String(i.id), src: i.src, alt: i.alt })), deleted,
+    preserved_variant_images: [...protectedIds].filter(Boolean) });
 }
 
 // Serialize Shopify calls inside each invocation and respect temporary throttling.
