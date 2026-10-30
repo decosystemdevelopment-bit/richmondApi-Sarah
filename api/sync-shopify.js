@@ -1,5 +1,8 @@
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+const requestCache = new AsyncLocalStorage();
 
 const SUPABASE_URL = requireEnv("SUPABASE_URL");
 const SUPABASE_KEY = requireAnyEnv(["SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY"]);
@@ -18,7 +21,11 @@ const shopify = axios.create({
   timeout: parseInt(process.env.SHOPIFY_TIMEOUT_MS || "45000", 10)
 });
 
-export default async function handler(req, res) {
+export default function handler(req, res) {
+  return requestCache.run({ products: new Map(), variants: new Map() }, () => handleRequest(req, res));
+}
+
+async function handleRequest(req, res) {
   res.setHeader("Cache-Control", "no-store");
   const expectedSecret = process.env.AUDIT_SECRET;
   if (!expectedSecret || req.headers.authorization !== `Bearer ${expectedSecret}`) {
@@ -52,6 +59,10 @@ export default async function handler(req, res) {
     const linkOnly = readBooleanQuery(req.query.linkOnly, false);
     const createMissing = readBooleanQuery(req.query.createMissing, DEFAULT_CREATE_MISSING);
     const syncImages = readBooleanQuery(req.query.syncImages, DEFAULT_SYNC_IMAGES);
+    const phase = cleanString(req.query.phase) || "all";
+    if (!["all", "priority", "information", "images"].includes(phase)) {
+      return res.status(400).json({ ok: false, error: "Invalid phase" });
+    }
 
     const accessToken = await getShopifyAccessToken();
     const headers = {
@@ -81,7 +92,9 @@ export default async function handler(req, res) {
         dryRun,
         linkOnly,
         createMissing,
-        syncImages
+        syncImages,
+        phase,
+        managedDraft: readBooleanQuery(req.query.managedDraft, false)
       });
 
       results.push(result);
@@ -95,6 +108,7 @@ export default async function handler(req, res) {
       linkOnly,
       createMissing,
       syncImages,
+      phase,
       results,
       durationMs: Date.now() - startedAt
     });
@@ -116,7 +130,9 @@ async function syncOneProduct({
   dryRun,
   linkOnly,
   createMissing,
-  syncImages
+  syncImages,
+  phase = "all",
+  managedDraft = false
 }) {
   const skuCandidates = buildSkuCandidates(product);
   const result = {
@@ -130,6 +146,18 @@ async function syncOneProduct({
   };
 
   try {
+    const priority = phase === "all" || phase === "priority";
+    const information = phase === "all" || phase === "information";
+    const media = phase === "all" || phase === "images";
+    const needsWork = (priority && (product.needs_price_update || product.needs_compare_at_price_update ||
+      (product.needs_stock_update && locationId))) ||
+      (information && (product.needs_status_update || product.needs_description_update)) ||
+      (media && syncImages && product.needs_images_update);
+    if (product.shopify_product_id && product.shopify_variant_id && !needsWork && !linkOnly) {
+      result.action = "unchanged";
+      if (product.needs_stock_update && !locationId && priority) result.skipped.push("stock_destination_not_configured");
+      return result;
+    }
     let match = await findShopifyMatch(product, skuCandidates, headers);
 
     if (!match && !createMissing) {
@@ -166,14 +194,16 @@ async function syncOneProduct({
         return result;
       }
 
-      match = await createShopifyProduct(product, headers);
+      match = await createShopifyProduct(product, headers, information);
       result.action = "created";
     } else {
       const live = await fetchProduct(match.productId, headers);
       if (live.vendor !== "Richmond Interiors") throw new Error("Vendor mismatch");
       const exactVariant = (live.variants || []).find(v => String(v.id) === String(match.variantId));
       if (!exactVariant || !skuCandidates.includes(cleanString(exactVariant.sku))) throw new Error("Stored SKU mismatch");
-      if (live.status !== "active") {
+      const ownedDraft = live.status === "draft" && (managedDraft ||
+        String(live.tags || "").split(",").some(tag => tag.trim() === "richmond-middleware-created"));
+      if (live.status !== "active" && !ownedDraft) {
         result.action = "skipped";
         result.skipped.push("shopify_" + live.status + "_preserved");
         return result;
@@ -215,13 +245,11 @@ async function syncOneProduct({
       return result;
     }
 
-    await saveShopifyIds(product.id, match);
-
     const clearedFlags = {};
 
-    if (product.needs_status_update || product.needs_description_update) {
+    if (information && (product.needs_status_update || product.needs_description_update)) {
       // Preserve existing Shopify title/body/status; refresh the existing technical metafields.
-      await upsertProductMetafields(product, match.productId, headers);
+      if (result.action !== "created") await upsertProductMetafields(product, match.productId, headers);
       result.skipped.push("existing_title_description_status_preserved");
 
       if (product.needs_status_update) {
@@ -235,14 +263,14 @@ async function syncOneProduct({
       }
     }
 
-    if (product.needs_price_update || product.needs_compare_at_price_update) {
+    if (priority && (product.needs_price_update || product.needs_compare_at_price_update)) {
       await updateVariantPricing(product, match.variantId, headers);
       clearedFlags.needs_price_update = false;
       clearedFlags.needs_compare_at_price_update = false;
       result.synced.push("price");
     }
 
-    if (product.needs_stock_update && locationId) {
+    if (priority && product.needs_stock_update && locationId) {
       const inventoryItemId =
         match.inventoryItemId || (await fetchInventoryItemId(match.variantId, headers));
 
@@ -251,10 +279,10 @@ async function syncOneProduct({
       result.synced.push("stock");
     }
 
-    if (product.needs_stock_update && !locationId) {
+    if (priority && product.needs_stock_update && !locationId) {
       result.skipped.push("stock_destination_not_configured");
     }
-    if (product.needs_images_update) {
+    if (media && product.needs_images_update) {
       if (syncImages) {
         const imageResult = await appendMissingImages(product, match.productId, headers);
         clearedFlags.needs_images_update = false;
@@ -376,6 +404,16 @@ async function findShopifyMatch(product, skuCandidates, headers) {
   const storedProductId = toLegacyId(product.shopify_product_id);
   const storedVariantId = toLegacyId(product.shopify_variant_id || product.variant_id);
 
+  // One product GET supplies status, all variants, prices and images.
+  if (storedProductId) {
+    const live = await fetchProduct(storedProductId, headers);
+    const variant = storedVariantId
+      ? (live.variants || []).find(v => String(v.id) === String(storedVariantId))
+      : chooseVariant(live.variants || [], skuCandidates);
+    if (!variant || !skuCandidates.includes(cleanString(variant.sku))) throw new Error("Stored product/variant SKU mismatch");
+    return { productId: live.id, variantId: variant.id, inventoryItemId: variant.inventory_item_id };
+  }
+
   if (storedVariantId) {
     const variant = await fetchVariant(storedVariantId, headers);
 
@@ -436,7 +474,7 @@ async function findShopifyMatch(product, skuCandidates, headers) {
   return null;
 }
 
-async function createShopifyProduct(product, headers) {
+async function createShopifyProduct(product, headers, syncInformation = true) {
   const payload = {
     product: {
       title: product.title || product.item_code,
@@ -444,6 +482,7 @@ async function createShopifyProduct(product, headers) {
       vendor: "Richmond Interiors",
       product_type: product.product_type || "",
       status: product.status === "archived" ? "archived" : "draft",
+      tags: "richmond-middleware-created",
       variants: [
         {
           sku: product.item_code_new || product.item_code,
@@ -460,7 +499,8 @@ async function createShopifyProduct(product, headers) {
   const created = response.data.product;
   const variant = created.variants[0];
 
-  await upsertProductMetafields(product, created.id, headers);
+  cacheProduct(created);
+  if (syncInformation) await upsertProductMetafields(product, created.id, headers);
 
   return {
     productId: created.id,
@@ -538,8 +578,7 @@ async function appendMissingImages(product, productId, headers) {
 
   if (desiredUrls.length === 0) return summary;
 
-  const response = await shopify.get(`/products/${productId}/images.json`, { headers });
-  const existingImages = response.data.images || [];
+  const existingImages = (await fetchProduct(productId, headers)).images || [];
   const existingFilenames = new Set(
     existingImages
       .map((image) => filenameFromUrl(image.src || image.alt || ""))
@@ -594,6 +633,8 @@ async function upsertProductMetafields(product, productId, headers) {
     const current = existing.find(
       (item) => item.namespace === metafield.namespace && item.key === metafield.key
     );
+
+    if (current && metafieldValuesEqual(current, metafield)) continue;
 
     if (current) {
       await shopify.put(
@@ -684,7 +725,10 @@ async function getLocationId(headers) {
 }
 
 async function fetchVariant(variantId, headers) {
+  const cache = requestCache.getStore();
+  if (cache?.variants.has(String(variantId))) return cache.variants.get(String(variantId));
   const response = await shopify.get(`/variants/${variantId}.json`, { headers });
+  cache?.variants.set(String(variantId), response.data.variant);
   return response.data.variant;
 }
 
@@ -694,8 +738,30 @@ async function fetchInventoryItemId(variantId, headers) {
 }
 
 async function fetchProduct(productId, headers) {
+  const cache = requestCache.getStore();
+  if (cache?.products.has(String(productId))) return cache.products.get(String(productId));
   const response = await shopify.get(`/products/${productId}.json`, { headers });
+  cacheProduct(response.data.product);
   return response.data.product;
+}
+
+function cacheProduct(product) {
+  const cache = requestCache.getStore();
+  if (!cache || !product) return;
+  cache.products.set(String(product.id), product);
+  for (const variant of product.variants || []) cache.variants.set(String(variant.id), variant);
+}
+
+function metafieldValuesEqual(a, b) {
+  if (a.type !== b.type) return false;
+  if (b.type === "number_decimal" || b.type === "number_integer") {
+    return Number.isFinite(Number(a.value)) && Number(a.value) === Number(b.value);
+  }
+  if (b.type === "json") {
+    try { return JSON.stringify(typeof a.value === "string" ? JSON.parse(a.value) : a.value) ===
+      JSON.stringify(typeof b.value === "string" ? JSON.parse(b.value) : b.value); } catch { return false; }
+  }
+  return String(a.value) === String(b.value);
 }
 
 async function searchVariantsBySku(sku, headers) {
