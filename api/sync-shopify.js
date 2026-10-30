@@ -1185,7 +1185,14 @@ async function cleanDuplicateImages(req, res) {
   }
   if (apply && deleted.length) {
     diagnostic.stage = "verify_gallery";
-    const after = await get();
+    // Shopify may briefly return the pre-deletion gallery. Never repeat DELETE
+    // for this: retry only the read, with a bounded verification window.
+    let after;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      after = await get();
+      if (!after.images.some(i => deleted.includes(String(i.id)))) break;
+      if (attempt < 4) await new Promise(resolve => setTimeout(resolve, 1000));
+    }
     if (after.images.some(i => deleted.includes(String(i.id)))) throw Error("Image deletion verification failed");
     const keptIds = (product.images || []).filter(i => !deleted.includes(String(i.id))).map(i => String(i.id));
     if (keptIds.some(id => !after.images.some(i => String(i.id) === id))) throw Error("Unexpected gallery change");
