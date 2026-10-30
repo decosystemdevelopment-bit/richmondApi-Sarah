@@ -342,12 +342,15 @@ function normalizePricing(pricing) {
 
 function normalizeStock(details, stock) {
   const onlineAvailability = cleanString(stock.onlineAvailabilityText);
-  const stockBucket = cleanString(stock.lastAvailableStock || details.lastAvailableStock);
-  const stockQuantity = parseStockQuantity(onlineAvailability || stockBucket);
+  const stockBucket = cleanString(stock.lastAvailableStock ?? details.lastAvailableStock);
+  // '-' is not a number. Fall back to the supplier's explicit secondary indication.
+  // Do not turn an unknown value into zero unless a supplier field actually says zero.
+  const primaryQuantity = parseStockQuantity(onlineAvailability);
+  const stockQuantity = primaryQuantity === null ? parseStockQuantity(stockBucket) : primaryQuantity;
 
   return {
     stock_quantity: stockQuantity,
-    stock_indicator: parseInteger(stock.StockIndicator || details.StockIndicator),
+    stock_indicator: parseInteger(stock.StockIndicator ?? details.StockIndicator),
     stock_bucket: stockBucket,
     online_availability_text: onlineAvailability,
     online_next_availability_text: cleanString(stock.onlineNextAvailabilityText)
@@ -595,16 +598,11 @@ function parseInteger(value) {
 
 function parseStockQuantity(value) {
   const text = cleanString(value);
-  if (!text || text === "-") return null;
-
-  const number = parseInteger(text);
-  if (number === null) return null;
-
-  if (text.startsWith("<")) {
-    return Math.max(number - 1, 0);
-  }
-
-  return number;
+  const match = text.match(/^([<>]?)\s*(\d+)$/);
+  if (!match) return null;
+  const quantity = Number(match[2]);
+  if (!Number.isSafeInteger(quantity)) return null;
+  return Math.max(0, quantity - (match[1] === "<" ? 1 : 0));
 }
 
 function parseRichmondBoolean(value) {
