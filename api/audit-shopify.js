@@ -19,6 +19,10 @@ export default async function handler(req, res) {
   }
   let stage = "configuration";
   try {
+    const mode = req.query.mode || "products";
+    if (!["products", "products-lite", "collections", "collection-products"].includes(mode)) {
+      return res.status(400).json({ ok: false, error: "Invalid read-only mode" });
+    }
     const shop = (process.env.SHOPIFY_SHOP || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
     const version = process.env.SHOPIFY_API_VERSION || "2026-04";
     const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
@@ -35,12 +39,55 @@ export default async function handler(req, res) {
       return res.status(502).json({ ok: false, stage, error: "Cannot read a unique Shopify token" });
     }
     stage = "shopify_read";
+    if (mode === "collections" || mode === "collection-products") {
+      const after = req.query.after || null;
+      if (after !== null && (typeof after !== "string" || after.length > 8192)) {
+        return res.status(400).json({ ok: false, error: "Invalid cursor" });
+      }
+      let variables = { after };
+      let query = `query CollectionsAudit($after: String) {
+        collections(first: 50, after: $after, sortKey: ID) {
+          nodes { id title handle updatedAt ruleSet { appliedDisjunctively rules { column relation condition } } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`;
+      if (mode === "collection-products") {
+        const id = req.query.collection_id;
+        if (typeof id !== "string" || !/^gid:\/\/shopify\/Collection\/\d+$/.test(id)) {
+          return res.status(400).json({ ok: false, error: "Invalid collection ID" });
+        }
+        variables.id = id;
+        query = `query CollectionMembersAudit($id: ID!, $after: String) {
+          collection(id: $id) { id products(first: 250, after: $after) {
+            nodes { id } pageInfo { hasNextPage endCursor }
+          } }
+        }`;
+      }
+      const response = await axios.post(`https://${shop}/admin/api/${version}/graphql.json`, { query, variables }, {
+        headers: { "X-Shopify-Access-Token": data.access_token }, timeout: 25000, maxRedirects: 0
+      });
+      if (response.data.errors?.length) {
+        const throttled = response.data.errors.every(e => e.extensions?.code === "THROTTLED");
+        if (throttled) res.setHeader("Retry-After", "3");
+        return res.status(throttled ? 429 : 502).json({ ok: false, stage: mode,
+          error: "GraphQL read rejected", codes: response.data.errors.map(e => e.extensions?.code || "UNKNOWN") });
+      }
+      if (mode === "collection-products" && !response.data.data?.collection) {
+        return res.status(404).json({ ok: false, error: "Collection no longer accessible" });
+      }
+      const connection = mode === "collections" ? response.data.data?.collections : response.data.data.collection.products;
+      if (!Array.isArray(connection?.nodes) || !connection.pageInfo) throw Error("Invalid read-only response");
+      if (connection.pageInfo.hasNextPage && !connection.pageInfo.endCursor) throw Error("Missing pagination cursor");
+      return res.status(200).json({ ok: true, read_only: true, shop, mode,
+        nodes: connection.nodes, next_cursor: connection.pageInfo.hasNextPage ? connection.pageInfo.endCursor : null });
+    }
     const response = await axios.get(`https://${shop}/admin/api/${version}/products.json`, {
       headers: { "X-Shopify-Access-Token": data.access_token },
       params: {
         limit: 250,
         ...(cursor ? { page_info: cursor } : {
-          fields: "id,title,handle,vendor,status,template_suffix,updated_at,created_at,published_at,body_html,tags,product_type,variants,images"
+          fields: mode === "products-lite" ? "id,title,handle,vendor,status,updated_at,product_type,tags,variants" :
+            "id,title,handle,vendor,status,template_suffix,updated_at,created_at,published_at,body_html,tags,product_type,variants,images"
         })
       },
       timeout: 25000,
