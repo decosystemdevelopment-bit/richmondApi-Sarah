@@ -32,6 +32,17 @@ function eligible(rows,job,tasks) {
   return rows.filter(r=>!states.has(r.item_code)||Date.parse(states.get(r.item_code).next_at)<=Date.now())
     .sort((a,b)=>(Date.parse(states.get(a.item_code)?.next_at||'1970-01-01')-Date.parse(states.get(b.item_code)?.next_at||'1970-01-01'))||String(a.item_code).localeCompare(String(b.item_code)));
 }
+function selectPending(rows,job,tasks,queue,limit) {
+  const ready=eligible(rows,job,tasks);
+  const authorised=new Map(queue.filter(q=>q.status==='pending').map(q=>[q.item_code,String(q.product_id)]));
+  const isNew=r=>!r.shopify_product_id||authorised.get(r.item_code)===String(r.shopify_product_id);
+  const priority=ready.filter(isNew),regular=ready.filter(r=>!isNew(r));
+  // Reserve capacity for existing products too: a continuous stream of new products
+  // must not starve stock/price maintenance of the current catalogue.
+  const first=priority.slice(0,Math.max(1,Math.floor(limit*0.8)));
+  const normal=regular.slice(0,limit-first.length);
+  return [...first,...normal,...priority.slice(first.length,first.length+limit-first.length-normal.length)];
+}
 export default async function handler(req,res){
   res.setHeader('Cache-Control','no-store');
   if(req.method!=='GET')return res.status(405).json({ok:false,error:'GET only'});
@@ -60,9 +71,9 @@ export default async function handler(req,res){
       const rows=storedRows.filter(r=>source.has(r.item_code));
       summary.absent_references_preserved=storedRows.length-rows.length;
       const tasks=await all('richmond_cron_tasks','job,item_code,attempts,next_at');
+      const queue=await all('richmond_publication_queue','item_code,product_id,status');
       if(job==='publish'){
         if(process.env.RICHMOND_AUTO_PUBLISH!=='true')throw Error('Automatic publication disabled');
-        const queue=await all('richmond_publication_queue');
         for(const entry of eligible(queue.filter(q=>q.status==='pending'&&source.has(q.item_code)),'publish',tasks).slice(0,5)){
           if(Date.now()-started>180000)break;
           await work(entry.item_code,async()=>{
@@ -71,13 +82,13 @@ export default async function handler(req,res){
           },job,summary);
         }
       }else if(job==='stock'){
-        const pending=eligible(rows.filter(r=>r.needs_stock_update&&r.shopify_variant_id),'stock',tasks).slice(0,50);
+        const pending=selectPending(rows.filter(r=>r.needs_stock_update&&r.shopify_variant_id),'stock',tasks,queue,50);
         if(pending.length){
           const output=await invoke(sync,{stockBatch:'true'},{item_codes:pending.map(r=>r.item_code),apply:true},started+240000);
           for(const result of output.results||[]){const problem=result.action==='error';await record(job,result.item_code,result,problem);summary.processed++;summary.errors+=Number(problem);if(result.action==='skipped')summary.skipped=(summary.skipped||0)+1;summary.results.push(result);}
         }
       }else{
-        const pending=eligible(rows.filter(r=>flags[job].some(f=>r[f])||(job==='prices'&&!r.shopify_product_id)),job,tasks).slice(0,5);
+        const pending=selectPending(rows.filter(r=>flags[job].some(f=>r[f])||(job==='prices'&&!r.shopify_product_id)),job,tasks,queue,5);
         for(const row of pending){
           if(Date.now()-started>180000)break;
           await work(row.item_code,async()=>{
